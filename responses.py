@@ -160,6 +160,30 @@ def responses_to_chat(resp_payload: dict) -> dict:
     inp = resp_payload.get("input")
     if isinstance(inp, list):
         pending_tool_calls = []
+
+        def flush_pending_tool_calls():
+            nonlocal pending_tool_calls
+            if not pending_tool_calls:
+                return
+            prior = messages[-1] if messages else None
+            if (
+                isinstance(prior, dict)
+                and prior.get("role") == "assistant"
+                and not prior.get("tool_calls")
+            ):
+                content = prior.get("content")
+                if isinstance(content, str) and content.strip():
+                    prior["tool_calls"] = pending_tool_calls
+                    pending_tool_calls = []
+                    return
+                messages.pop()
+            messages.append({
+                "role": "assistant",
+                "content": None,
+                "tool_calls": pending_tool_calls,
+            })
+            pending_tool_calls = []
+
         for item in inp:
             chat_msg = _input_item_to_chat_message(item)
             if not chat_msg:
@@ -172,13 +196,7 @@ def responses_to_chat(resp_payload: dict) -> dict:
                 pending_tool_calls.extend(chat_msg["tool_calls"])
                 continue
 
-            if pending_tool_calls:
-                messages.append({
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": pending_tool_calls,
-                })
-                pending_tool_calls = []
+            flush_pending_tool_calls()
 
             # 清洗 system/developer 消息
             if chat_msg.get("role") in ("system", "developer"):
@@ -189,12 +207,7 @@ def responses_to_chat(resp_payload: dict) -> dict:
                 )
             messages.append(chat_msg)
 
-        if pending_tool_calls:
-            messages.append({
-                "role": "assistant",
-                "content": None,
-                "tool_calls": pending_tool_calls,
-            })
+        flush_pending_tool_calls()
     elif isinstance(inp, str) and inp.strip():
         messages.append({"role": "user", "content": inp})
 

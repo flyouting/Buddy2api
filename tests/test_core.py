@@ -3326,3 +3326,74 @@ def test_overseas_stream_request_gets_system_message(monkeypatch, isolated_db):
     messages = captured["json"]["messages"]
     assert messages[0]["role"] == "system"
     assert messages[1] == {"role": "user", "content": "hi"}
+
+
+def test_responses_to_chat_merges_assistant_text_with_function_calls():
+    payload = {
+        "input": [
+            {"type": "message", "role": "user", "content": "看看目录"},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "我先看一下目录。"}],
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_first",
+                "name": "exec_command",
+                "arguments": '{"cmd":"ls"}',
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_second",
+                "name": "exec_command",
+                "arguments": '{"cmd":"pwd"}',
+            },
+            {"type": "function_call_output", "call_id": "call_first", "output": "a.txt"},
+            {"type": "function_call_output", "call_id": "call_second", "output": "/tmp"},
+        ],
+    }
+
+    messages = responses.responses_to_chat(payload)["messages"]
+
+    assert [message["role"] for message in messages] == ["user", "assistant", "tool", "tool"]
+    assert messages[1]["content"] == "我先看一下目录。"
+    assert [call["id"] for call in messages[1]["tool_calls"]] == ["call_first", "call_second"]
+
+
+def test_responses_to_chat_drops_empty_assistant_text_before_function_calls():
+    payload = {
+        "input": [
+            {"type": "message", "role": "user", "content": "看看目录"},
+            {"type": "message", "role": "assistant", "content": []},
+            {
+                "type": "function_call",
+                "call_id": "call_first",
+                "name": "exec_command",
+                "arguments": "{}",
+            },
+            {"type": "function_call_output", "call_id": "call_first", "output": "a.txt"},
+        ],
+    }
+
+    messages = responses.responses_to_chat(payload)["messages"]
+
+    assert [message["role"] for message in messages] == ["user", "assistant", "tool"]
+    assert messages[1]["content"] is None
+    assert len(messages[1]["tool_calls"]) == 1
+
+
+def test_responses_to_chat_keeps_assistant_text_without_tools():
+    payload = {
+        "input": [
+            {"type": "message", "role": "user", "content": "你好"},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "你好！"}]},
+            {"type": "message", "role": "user", "content": "继续"},
+        ],
+    }
+
+    messages = responses.responses_to_chat(payload)["messages"]
+
+    assert [message["role"] for message in messages] == ["user", "assistant", "user"]
+    assert messages[1]["content"] == "你好！"
+    assert "tool_calls" not in messages[1]
