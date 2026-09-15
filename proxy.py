@@ -246,6 +246,27 @@ def build_backend_body(payload: dict) -> dict:
     return body
 
 
+_OVERSEAS_DEFAULT_SYSTEM = "You are a helpful assistant."
+
+
+def _ensure_system_first_message(body: dict, account: dict) -> dict:
+    """workbuddy.ai 国际版要求 messages 首条必须是 system，缺失时补一条通用 system。"""
+    if not auth_manager.is_overseas_account(account):
+        return body
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return body
+    first = messages[0]
+    if isinstance(first, dict) and first.get("role") == "system":
+        return body
+    patched = dict(body)
+    patched["messages"] = [
+        {"role": "system", "content": _OVERSEAS_DEFAULT_SYSTEM},
+        *messages,
+    ]
+    return patched
+
+
 def get_all_aliases() -> dict:
     """Return merged WorkBuddy aliases (built-in + user-defined)."""
     import aliases
@@ -719,9 +740,10 @@ async def proxy_chat_completions(
             auth_manager.mark_account_failure(account["id"], 401)
             continue
 
-        url = f"{auth_manager.backend_url()}/v2/chat/completions"
+        url = f"{auth_manager.backend_url_for(account)}/v2/chat/completions"
+        attempt_body = _ensure_system_first_message(body, account)
         t0 = time.time()
-        result = await _collect_stream(url, headers, body, account, api_key_info, model_name, t0)
+        result = await _collect_stream(url, headers, attempt_body, account, api_key_info, model_name, t0)
         if result[0] == "json":
             # 工具停转修复：agent 回合被上游以 stop+纯文本结束且未调用工具时，
             # 用 tool_choice=required 重试一次；重试产出工具调用则采用重试结果。
@@ -729,12 +751,12 @@ async def proxy_chat_completions(
                 choice = (result[1].get("choices") or [{}])[0]
                 message = choice.get("message") or {}
                 if _is_tool_stall(
-                    body,
+                    attempt_body,
                     choice.get("finish_reason"),
                     bool(message.get("tool_calls")),
                     message.get("content") or "",
                 ):
-                    retry_body = {**body, "tool_choice": "required"}
+                    retry_body = {**attempt_body, "tool_choice": "required"}
                     retry_t0 = time.time()
                     retry_result = await _collect_stream(
                         url, headers, retry_body, account, api_key_info, model_name, retry_t0
@@ -786,10 +808,13 @@ async def test_account_chat(account: dict, model: str = "auto", prompt: str = "p
 
     body = build_backend_body({
         "model": model or "auto",
-        "messages": [{"role": "user", "content": prompt or "ping"}],
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant."},
+            {"role": "user", "content": prompt or "ping"},
+        ],
         "stream": False,
     })
-    url = f"{auth_manager.backend_url()}/v2/chat/completions"
+    url = f"{auth_manager.backend_url_for(account)}/v2/chat/completions"
     t0 = time.time()
     result = await _collect_stream(url, headers, body, account, None, f"account-test:{model or 'auto'}", t0)
     duration_ms = int((time.time() - t0) * 1000)
@@ -811,7 +836,10 @@ async def test_account_chat(account: dict, model: str = "auto", prompt: str = "p
     msg = detail
     if isinstance(detail, dict):
         err = detail.get("error") if isinstance(detail.get("error"), dict) else detail
-        msg = err.get("message") if isinstance(err, dict) else detail
+        if isinstance(err, dict):
+            msg = err.get("message") or err.get("msg") or detail
+        else:
+            msg = detail
     return {
         "ok": False,
         "status_code": status,
@@ -866,10 +894,11 @@ async def _stream_upstream(
             last_status = 401
             continue
 
-        url = f"{auth_manager.backend_url()}/v2/chat/completions"
+        url = f"{auth_manager.backend_url_for(account)}/v2/chat/completions"
+        attempt_body = _ensure_system_first_message(body, account)
         t0 = time.time()
         last_started = t0
-        observer = _ChatStreamObserver(body.get("model") or model_name, body.get("n", 1))
+        observer = _ChatStreamObserver(attempt_body.get("model") or model_name, attempt_body.get("n", 1))
         decoder = _SSEEventDecoder()
         output_started = False
         pending_terminal_events: list[bytes] = []
@@ -884,7 +913,7 @@ async def _stream_upstream(
                 pool=10,
             )
             async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream("POST", url, headers=headers, json=body) as response:
+                async with client.stream("POST", url, headers=headers, json=attempt_body) as response:
                     if response.status_code != 200:
                         raw_error = await response.aread()
                         last_error = raw_error

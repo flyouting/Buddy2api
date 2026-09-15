@@ -475,3 +475,88 @@ def test_manual_add_rejects_unknown_channel(isolated_db, all_channels):
         catalog.upsert_model("workbuddy", "glm-5.2")
     with pytest.raises(catalog.CatalogError):
         catalog.remove_model("workbuddy", "glm-5.2")
+
+
+DOMESTIC_WB_PAYLOAD = {
+    "code": 0,
+    "msg": "ok",
+    "data": {
+        "models": [
+            {"id": "deepseek-v4.1-flash", "name": "Deepseek-V4.1-Flash"},
+            {"id": "glm-5.2", "name": "GLM-5.2"},
+        ]
+    },
+}
+
+OVERSEAS_WB_PAYLOAD = {
+    "code": 0,
+    "msg": "ok",
+    "data": {
+        "models": [
+            {"id": "gpt-5.6-sol", "name": "GPT-5.6-Sol"},
+            {"id": "glm-5.2", "name": "GLM-5.2"},
+        ]
+    },
+}
+
+
+def test_workbuddy_catalog_merges_accounts_and_routes_by_domain(isolated_db, monkeypatch):
+    import catalog
+
+    monkeypatch.setenv("CB_GATEWAY_PROVIDERS", "workbuddy")
+    db.add_account(
+        {
+            "name": "domestic",
+            "uid": "wb-domestic",
+            "provider": "workbuddy",
+            "status": "active",
+            "domain": "www.codebuddy.cn",
+            "access_token": "tok-domestic",
+            "expires_at": 9_999_999_999_999,
+        }
+    )
+    db.add_account(
+        {
+            "name": "overseas",
+            "uid": "wb-overseas",
+            "provider": "workbuddy",
+            "status": "active",
+            "domain": "www.workbuddy.ai",
+            "access_token": "tok-overseas",
+            "expires_at": 9_999_999_999_999,
+        }
+    )
+
+    requested = []
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def get(self, url, **kwargs):
+            requested.append(str(url))
+            if "www.workbuddy.ai" in str(url):
+                return _FakeResponse(OVERSEAS_WB_PAYLOAD)
+            return _FakeResponse(DOMESTIC_WB_PAYLOAD)
+
+    monkeypatch.setattr("providers.workbuddy.models.httpx.AsyncClient", FakeAsyncClient)
+
+    result = asyncio.run(catalog.refresh_one("workbuddy"))
+    ids = _ids(result["models"])
+
+    assert result["mode"] == "live"
+    assert "deepseek-v4.1-flash" in ids
+    assert "gpt-5.6-sol" in ids
+    assert "glm-5.2" in ids
+    assert any(url.startswith("https://copilot.tencent.com") for url in requested)
+    assert any(url.startswith("https://www.workbuddy.ai") for url in requested)
+
+    monkeypatch.delenv("CB_GATEWAY_PROVIDERS", raising=False)
+    assert providers.get_provider("workbuddy").accepts_model("deepseek-v4.1-flash")
+    assert providers.get_provider("workbuddy").accepts_model("gpt-5.6-sol")

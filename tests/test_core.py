@@ -3181,3 +3181,148 @@ def test_stream_tool_stall_is_logged(monkeypatch, isolated_db):
     assert b"tool stall" not in raw
     logged_finishes = [entry[0][8] for entry in calls["logs"]]
     assert "tool_stall" in logged_finishes
+
+
+def test_backend_url_for_routes_overseas_accounts(monkeypatch):
+    monkeypatch.setattr(auth_manager, "backend_url", lambda: "https://copilot.tencent.com")
+    assert auth_manager.backend_url_for({"domain": "www.workbuddy.ai"}) == "https://www.workbuddy.ai"
+    assert auth_manager.backend_url_for({"domain": "staging.workbuddy.ai"}) == "https://staging.workbuddy.ai"
+    assert auth_manager.backend_url_for({"domain": "www.codebuddy.cn"}) == "https://copilot.tencent.com"
+    assert auth_manager.backend_url_for({"domain": ""}) == "https://copilot.tencent.com"
+    assert auth_manager.backend_url_for(None) == "https://copilot.tencent.com"
+
+
+def test_backend_url_for_matches_domain_case_insensitively(monkeypatch):
+    monkeypatch.setattr(auth_manager, "backend_url", lambda: "https://copilot.tencent.com")
+    assert auth_manager.backend_url_for({"domain": "WWW.WorkBuddy.AI"}) == "https://www.workbuddy.ai"
+    assert auth_manager.backend_url_for({"domain": "notworkbuddy.ai"}) == "https://copilot.tencent.com"
+
+
+def test_account_test_sends_system_prompt_to_overseas_backend(monkeypatch, isolated_db):
+    captured = {}
+
+    async def fake_headers(account):
+        return {"Authorization": "Bearer test"}
+
+    async def fake_collect(url, headers, body, account, api_key_info, model_name, t0):
+        captured["url"] = url
+        captured["body"] = body
+        return ("json", {"choices": [{"message": {"content": "pong"}}], "model": "auto", "usage": {}})
+
+    monkeypatch.setattr(auth_manager, "get_valid_headers", fake_headers)
+    monkeypatch.setattr(proxy, "_collect_stream", fake_collect)
+
+    account = {
+        "id": 4,
+        "name": "flyouting",
+        "domain": "www.workbuddy.ai",
+        "expires_at": 9_999_999_999_999,
+    }
+    result = asyncio.run(proxy.test_account_chat(account, "auto", "ping"))
+
+    assert result["ok"] is True
+    assert captured["url"] == "https://www.workbuddy.ai/v2/chat/completions"
+    assert captured["body"]["messages"][0]["role"] == "system"
+    assert captured["body"]["messages"][-1] == {"role": "user", "content": "ping"}
+
+
+def test_ensure_system_first_message_only_patches_overseas(monkeypatch):
+    body = {"messages": [{"role": "user", "content": "hi"}]}
+    overseas = {"id": 4, "domain": "www.workbuddy.ai"}
+    domestic = {"id": 3, "domain": "www.codebuddy.cn"}
+
+    patched = proxy._ensure_system_first_message(body, overseas)
+    assert patched is not body
+    assert patched["messages"][0]["role"] == "system"
+    assert patched["messages"][1] == {"role": "user", "content": "hi"}
+    assert body["messages"][0]["role"] == "user"
+
+    with_system = {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}]}
+    assert proxy._ensure_system_first_message(with_system, overseas) is with_system
+    assert proxy._ensure_system_first_message(body, domestic) is body
+    assert proxy._ensure_system_first_message({"messages": []}, overseas) == {"messages": []}
+    assert proxy._ensure_system_first_message({}, overseas) == {}
+
+
+def test_overseas_stream_request_gets_system_message(monkeypatch, isolated_db):
+    captured = {}
+
+    class FakeResponse:
+        status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def aiter_bytes(self):
+            for chunk in (
+                _chat_sse({
+                    "id": "c1", "object": "chat.completion.chunk", "created": 1,
+                    "choices": [{"index": 0, "delta": {"content": "ok"}, "finish_reason": None}],
+                }),
+                _chat_sse({
+                    "id": "c1", "object": "chat.completion.chunk", "created": 1,
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                }),
+                b"data: [DONE]\n\n",
+            ):
+                yield chunk
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        def stream(self, *args, headers, json=None, **kwargs):
+            captured["json"] = json
+            return FakeResponse()
+
+    account = {
+        "id": 4,
+        "name": "overseas",
+        "domain": "www.workbuddy.ai",
+        "expires_at": 9_999_999_999_999,
+    }
+
+    async def pick_account(excluded):
+        return account
+
+    async def valid_headers(_account):
+        return {"Authorization": "Bearer test"}
+
+    async def noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(auth_manager, "pick_account_with_fallback", pick_account)
+    monkeypatch.setattr(auth_manager, "get_valid_headers", valid_headers)
+    monkeypatch.setattr(auth_manager, "mark_account_success", noop)
+    monkeypatch.setattr(auth_manager, "mark_account_failure", noop)
+    monkeypatch.setattr(proxy, "_log_request", noop)
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeAsyncClient)
+
+    async def collect():
+        return b"".join([
+            chunk
+            async for chunk in proxy._stream_upstream(
+                {
+                    "model": "deepseek-v4.1-flash",
+                    "stream": True,
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                None,
+                "deepseek-v4.1-flash",
+            )
+        ])
+
+    asyncio.run(collect())
+
+    messages = captured["json"]["messages"]
+    assert messages[0]["role"] == "system"
+    assert messages[1] == {"role": "user", "content": "hi"}

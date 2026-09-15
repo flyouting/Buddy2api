@@ -53,6 +53,23 @@ def backend_url() -> str:
     return value if value.startswith("https://") else BACKEND
 
 
+OVERSEAS_BACKEND_SUFFIX = "workbuddy.ai"
+
+
+def is_overseas_account(account: Optional[dict]) -> bool:
+    """workbuddy.ai 国际版账号：后端地址与消息约束都与国内版不同。"""
+    domain = str((account or {}).get("domain") or "").strip().lower()
+    return domain == OVERSEAS_BACKEND_SUFFIX or domain.endswith("." + OVERSEAS_BACKEND_SUFFIX)
+
+
+def backend_url_for(account: Optional[dict]) -> str:
+    """按账号域选择后端：workbuddy.ai 国际版走自家网关，其余沿用 backend_url。"""
+    domain = str((account or {}).get("domain") or "").strip().lower()
+    if is_overseas_account(account):
+        return f"https://{domain}"
+    return backend_url()
+
+
 def request_timeout(default: int) -> int:
     try:
         return max(5, min(600, int(db.get_setting("timeout", default))))
@@ -362,7 +379,7 @@ async def refresh_token(account: dict) -> bool:
     lock = _get_token_lock(aid)
     async with lock:
         headers = build_refresh_headers(account)
-        url = f"{backend_url()}/v2/plugin/auth/token/refresh"
+        url = f"{backend_url_for(account)}/v2/plugin/auth/token/refresh"
 
         try:
             async with httpx.AsyncClient(timeout=request_timeout(15)) as c:
@@ -678,7 +695,7 @@ async def fetch_account_resources(
 
     try:
         async with httpx.AsyncClient(timeout=request_timeout(25)) as c:
-            r = await c.post(f"{backend_url()}/v2/billing/meter/get-user-resource", headers=headers, json={})
+            r = await c.post(f"{backend_url_for(account)}/v2/billing/meter/get-user-resource", headers=headers, json={})
             data = r.json()
     except (httpx.HTTPError, ValueError) as e:
         return _resource_failure(
@@ -800,7 +817,7 @@ async def fetch_checkin_status(
 
     try:
         async with httpx.AsyncClient(timeout=request_timeout(20)) as c:
-            r = await c.post(f"{backend_url()}/v2/billing/meter/checkin-activity-status", headers=headers, json={})
+            r = await c.post(f"{backend_url_for(account)}/v2/billing/meter/checkin-activity-status", headers=headers, json={})
             data = r.json()
     except (httpx.HTTPError, ValueError) as e:
         return _checkin_failure(account, status_code=0, message=str(e)[:240], allow_stale=allow_stale)
@@ -854,7 +871,7 @@ async def claim_daily_checkin(account: dict) -> dict:
 
     try:
         async with httpx.AsyncClient(timeout=request_timeout(30)) as c:
-            r = await c.post(f"{backend_url()}/v2/billing/meter/daily-checkin", headers=headers, json={})
+            r = await c.post(f"{backend_url_for(account)}/v2/billing/meter/daily-checkin", headers=headers, json={})
             data = r.json()
     except (httpx.HTTPError, ValueError) as e:
         return _checkin_result(account, ok=False, status_code=0, message=str(e)[:240])

@@ -287,8 +287,12 @@ async def refresh_one(channel: str) -> dict:
             message="no supplier-list API",
             display_name=display_name,
         )
-    account = await _pick_account(provider)
-    if not account:
+    accounts = db.get_active_accounts(channel)
+    if not accounts:
+        revived = await _pick_account(provider)
+        if revived:
+            accounts = [revived]
+    if not accounts:
         return _status_row(
             channel,
             mode="fallback",
@@ -296,22 +300,22 @@ async def refresh_one(channel: str) -> dict:
             message="no usable account",
             display_name=display_name,
         )
-    try:
-        fetched = normalize_models(await fetcher(account))
-    except Exception as exc:
-        return _status_row(
-            channel,
-            mode="fallback",
-            models=fallback,
-            message=str(exc)[:240],
-            display_name=display_name,
-        )
+    fetched: list[dict] = []
+    errors: list[str] = []
+    for account in accounts:
+        try:
+            part = normalize_models(await fetcher(account))
+        except Exception as exc:
+            errors.append(str(exc)[:120])
+            continue
+        if part:
+            fetched = _merge_models(fetched, part)
     if not fetched:
         return _status_row(
             channel,
             mode="fallback",
             models=fallback,
-            message="empty supplier list",
+            message="; ".join(errors)[:240] or "empty supplier list",
             display_name=display_name,
         )
     save_catalog(channel, fetched)
