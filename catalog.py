@@ -12,6 +12,7 @@ import time
 from typing import Any, Awaitable, Callable
 
 import database as db
+import auth_manager
 
 CATALOG_SETTING = "channel_catalogs"
 REFRESH_SETTING = "channel_catalog_refresh"
@@ -309,6 +310,7 @@ async def refresh_one(channel: str) -> dict:
             errors.append(str(exc)[:120])
             continue
         if part:
+            auth_manager.save_account_models(account, part)
             fetched = _merge_models(fetched, part)
     if not fetched:
         return _status_row(
@@ -328,6 +330,38 @@ async def refresh_one(channel: str) -> dict:
         message="",
         display_name=display_name,
     )
+
+
+async def refresh_account_models(
+    channel: str,
+    max_age_seconds: int = 12 * 3600,
+) -> dict:
+    """按账号刷新各自的供应模型列表，供按域名/后端分流路由使用。"""
+    import providers
+
+    provider = providers.get_provider(channel)
+    fetcher = LIVE_FETCHERS.get(channel)
+    if provider is None or fetcher is None:
+        return {"refreshed": 0, "skipped": 0, "errors": []}
+    now = int(time.time())
+    refreshed = 0
+    skipped = 0
+    errors: list[str] = []
+    for account in db.get_active_accounts(channel):
+        if max_age_seconds and auth_manager.account_models_updated_at(account) > now - max_age_seconds:
+            skipped += 1
+            continue
+        try:
+            part = normalize_models(await fetcher(account))
+        except Exception as exc:
+            errors.append(str(exc)[:120])
+            continue
+        if not part:
+            errors.append("empty supplier list")
+            continue
+        auth_manager.save_account_models(account, part)
+        refreshed += 1
+    return {"refreshed": refreshed, "skipped": skipped, "errors": errors}
 
 
 async def refresh_supplier_catalogs() -> dict:
@@ -351,6 +385,36 @@ async def refresh_supplier_catalogs() -> dict:
     return {"sources": sources}
 
 
+def _backend_model_groups(channel: str, models: list[dict]) -> list[dict]:
+    """把 workbuddy 的模型按后端来源拆开展示：海外 workbuddy / 国内 codebuddy。"""
+    if channel != "workbuddy":
+        return []
+    overseas_ids: set[str] = set()
+    domestic_ids: set[str] = set()
+    for account in db.get_active_accounts(channel):
+        ids = auth_manager.account_model_ids(account)
+        if not ids:
+            continue
+        if auth_manager.is_overseas_account(account):
+            overseas_ids |= ids
+        else:
+            domestic_ids |= ids
+    if not overseas_ids and not domestic_ids:
+        return []
+    groups: list[dict] = []
+    for key, label, ids in (
+        ("workbuddy", "WorkBuddy 海外版（workbuddy.ai）", overseas_ids),
+        ("codebuddy", "CodeBuddy 国内版（codebuddy.cn）", domestic_ids),
+    ):
+        rows = [dict(item) for item in models if str(item.get("id")) in ids]
+        if rows:
+            groups.append({"key": key, "label": label, "count": len(rows), "models": rows})
+    manual = [dict(item) for item in models if item.get("manual")]
+    if manual:
+        groups.append({"key": "manual", "label": "手动添加", "count": len(manual), "models": manual})
+    return groups
+
+
 def catalog_snapshot() -> dict:
     import providers
 
@@ -364,16 +428,19 @@ def catalog_snapshot() -> dict:
             models = workbuddy_fallback_models()
         else:
             models = []
+        annotated = _with_manual(channel, models)
         meta = refresh.get(channel) if isinstance(refresh.get(channel), dict) else {}
-        sources.append(
-            {
-                "channel": channel,
-                "display_name": getattr(provider, "display_name", channel) if provider else channel,
-                "mode": meta.get("mode") or ("fallback" if channel not in LIVE_FETCHERS else "static"),
-                "message": meta.get("message") or "",
-                "count": len(models),
-                "models": _with_manual(channel, models),
-                "updated_at": meta.get("updated_at"),
-            }
-        )
+        row = {
+            "channel": channel,
+            "display_name": getattr(provider, "display_name", channel) if provider else channel,
+            "mode": meta.get("mode") or ("fallback" if channel not in LIVE_FETCHERS else "static"),
+            "message": meta.get("message") or "",
+            "count": len(annotated),
+            "models": annotated,
+            "updated_at": meta.get("updated_at"),
+        }
+        groups = _backend_model_groups(channel, annotated)
+        if groups:
+            row["groups"] = groups
+        sources.append(row)
     return {"sources": sources}

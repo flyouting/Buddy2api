@@ -927,11 +927,176 @@ def _route_weight(account: dict) -> int:
     return max(1, _route_int(account.get("weight"), 1))
 
 
+MODEL_UNAVAILABLE_SETTING = "model_unavailable"
+MODEL_UNAVAILABLE_TTL = 7 * 86400
+
+ACCOUNT_MODELS_SETTING = "account_models"
+
+
+def _model_unavailable_map() -> dict:
+    value = db.get_setting(MODEL_UNAVAILABLE_SETTING, {}) or {}
+    return value if isinstance(value, dict) else {}
+
+
+def _account_models_map() -> dict:
+    value = db.get_setting(ACCOUNT_MODELS_SETTING, {}) or {}
+    return value if isinstance(value, dict) else {}
+
+
+def save_account_models(account: dict, models: list[dict]):
+    """记录该账号（按 uid）自己那份供应模型列表，用于按域名/后端分流。"""
+    uid = str(account.get("uid") or "")
+    ids = sorted({
+        str(item.get("id"))
+        for item in models
+        if isinstance(item, dict) and item.get("id")
+    })
+    if not uid or not ids:
+        return
+    data = _account_models_map()
+    entry = data.get(uid) if isinstance(data.get(uid), dict) else {}
+    learned = entry.get("learned")
+    data[uid] = {
+        "models": ids,
+        "learned": learned if isinstance(learned, list) else [],
+        "updated_at": int(time.time()),
+    }
+    db.set_setting(ACCOUNT_MODELS_SETTING, data)
+
+
+def account_model_ids(account: dict) -> Optional[set[str]]:
+    uid = str((account or {}).get("uid") or "")
+    if not uid:
+        return None
+    entry = _account_models_map().get(uid)
+    if not isinstance(entry, dict):
+        return None
+    ids: set[str] = set()
+    for field in ("models", "learned"):
+        values = entry.get(field)
+        if isinstance(values, list):
+            ids |= {str(item) for item in values if item}
+    return ids or None
+
+
+def account_models_updated_at(account: dict) -> int:
+    uid = str((account or {}).get("uid") or "")
+    if not uid:
+        return 0
+    entry = _account_models_map().get(uid)
+    if not isinstance(entry, dict):
+        return 0
+    try:
+        return int(entry.get("updated_at") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def mark_model_available(account: dict, model: Optional[str]):
+    """该账号成功跑过这个模型，记下来：即使供应列表没列它，也视为可用。"""
+    key = str(model or "").strip()
+    uid = str(account.get("uid") or "")
+    if not key or not uid:
+        return
+    data = _account_models_map()
+    entry = data.get(uid) if isinstance(data.get(uid), dict) else {}
+    supplier = entry.get("models") if isinstance(entry.get("models"), list) else []
+    learned = [str(item) for item in (entry.get("learned") or []) if item]
+    changed = False
+    if key not in supplier and key not in learned:
+        learned.append(key)
+        changed = True
+    if _clear_model_unavailable(uid, key):
+        changed = True
+    if not changed:
+        return
+    data[uid] = {
+        "models": supplier,
+        "learned": sorted(set(learned)),
+        "updated_at": int(entry.get("updated_at") or 0),
+    }
+    db.set_setting(ACCOUNT_MODELS_SETTING, data)
+
+
+def _clear_model_unavailable(uid: str, model: str) -> bool:
+    data = _model_unavailable_map()
+    entry = data.get(uid)
+    if not isinstance(entry, dict) or model not in entry:
+        return False
+    entry = {k: v for k, v in entry.items() if k != model}
+    if entry:
+        data[uid] = entry
+    else:
+        data.pop(uid, None)
+    db.set_setting(MODEL_UNAVAILABLE_SETTING, data)
+    return True
+
+
+def _accounts_serving_model(candidates: list[dict], model: Optional[str]) -> list[dict]:
+    """优先只保留供应列表里明确有该模型的账号；列表未知的退而求其次。"""
+    key = str(model or "").strip()
+    if not key:
+        return candidates
+    listed = [a for a in candidates if key in (account_model_ids(a) or set())]
+    if listed:
+        return listed
+    unknown = [a for a in candidates if account_model_ids(a) is None]
+    return unknown or candidates
+
+
+def model_is_unavailable(account: dict, model: Optional[str]) -> bool:
+    """账号是否已记录过不支持该模型（如上游 11102 model service info not found）。"""
+    key = str(model or "").strip()
+    uid = str(account.get("uid") or "")
+    if not key or not uid:
+        return False
+    entry = _model_unavailable_map().get(uid)
+    if not isinstance(entry, dict):
+        return False
+    ts = entry.get(key)
+    if not isinstance(ts, (int, float)):
+        return False
+    return time.time() - ts <= MODEL_UNAVAILABLE_TTL
+
+
+def mark_model_unavailable(account: dict, model: Optional[str]):
+    key = str(model or "").strip()
+    uid = str(account.get("uid") or "")
+    if not key or not uid:
+        return
+    now = int(time.time())
+    data = _model_unavailable_map()
+    entry = {
+        name: ts
+        for name, ts in (data.get(uid) or {}).items()
+        if isinstance(ts, (int, float)) and now - ts <= MODEL_UNAVAILABLE_TTL
+    }
+    entry[key] = now
+    data[uid] = entry
+    db.set_setting(MODEL_UNAVAILABLE_SETTING, data)
+    models = _account_models_map()
+    current = models.get(uid)
+    if isinstance(current, dict):
+        learned = [str(item) for item in (current.get("learned") or []) if item]
+        if key in learned:
+            models[uid] = {
+                **current,
+                "learned": [item for item in learned if item != key],
+            }
+            db.set_setting(ACCOUNT_MODELS_SETTING, models)
+
+
+def _sticky_key(provider: str, model: Optional[str]) -> str:
+    key = str(model or "").strip()
+    return f"{provider}:{key}" if key else provider
+
+
 def _route_sort_key(account: dict):
     weight = _route_weight(account)
     total_requests = _route_int(account.get("total_requests"), 0)
     return (
         -_route_priority(account),
+        0 if is_overseas_account(account) else 1,
         -weight,
         total_requests / weight,
         total_requests,
@@ -939,13 +1104,18 @@ def _route_sort_key(account: dict):
     )
 
 
-def _set_sticky_account(aid: int, provider: str = "workbuddy"):
+def _set_sticky_account(aid: int, provider: str = "workbuddy", model: Optional[str] = None):
     with _route_lock:
-        _sticky_account_id[provider] = aid
+        _sticky_account_id[_sticky_key(provider, model)] = aid
 
 
-def pick_account(exclude_ids: set[int] = None, provider: str = "workbuddy") -> Optional[dict]:
-    """选择一个可用账号。优先级越高越先用，同优先级尽量粘住当前账号。"""
+def pick_account(
+    exclude_ids: set[int] = None,
+    provider: str = "workbuddy",
+    model: Optional[str] = None,
+) -> Optional[dict]:
+    """选择一个可用账号。优先级越高越先用；同级优先 workbuddy.ai 海外版；
+    已记录不支持该模型的账号尽量避开，同优先级尽量粘住当前账号。"""
     exclude_ids = exclude_ids or set()
     accounts = db.get_active_accounts(provider)
     candidates = [
@@ -955,25 +1125,33 @@ def pick_account(exclude_ids: set[int] = None, provider: str = "workbuddy") -> O
     if not candidates:
         return None
 
+    capable = [a for a in candidates if not model_is_unavailable(a, model)]
+    if capable:
+        candidates = capable
+    candidates = _accounts_serving_model(candidates, model)
+
     highest_priority = max(_route_priority(a) for a in candidates)
     top_candidates = [a for a in candidates if _route_priority(a) == highest_priority]
+    sticky_key = _sticky_key(provider, model)
     with _route_lock:
-        sticky_id = _sticky_account_id.get(provider)
+        sticky_id = _sticky_account_id.get(sticky_key)
         if sticky_id is not None:
             sticky = next((a for a in top_candidates if a["id"] == sticky_id), None)
             if sticky:
                 return sticky
 
         chosen = sorted(top_candidates, key=_route_sort_key)[0]
-        _sticky_account_id[provider] = chosen["id"]
+        _sticky_account_id[sticky_key] = chosen["id"]
         return chosen
 
 
 async def pick_account_with_fallback(
-    exclude_ids: set[int] = None, provider: str = "workbuddy"
+    exclude_ids: set[int] = None,
+    provider: str = "workbuddy",
+    model: Optional[str] = None,
 ) -> Optional[dict]:
     """选账号，如果全部过期则尝试刷新过期账号。只刷新同一 provider。"""
-    account = pick_account(exclude_ids, provider=provider)
+    account = pick_account(exclude_ids, provider=provider, model=model)
     if account:
         return account
 
@@ -991,7 +1169,7 @@ async def pick_account_with_fallback(
         if await refresh_token(a):
             fresh = db.get_account(a["id"])
             if fresh:
-                _set_sticky_account(fresh["id"], provider)
+                _set_sticky_account(fresh["id"], provider, model)
             return fresh
     return None
 

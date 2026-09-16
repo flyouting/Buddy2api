@@ -546,11 +546,14 @@ async def admin_import_accounts(
     ):
         raise HTTPException(status_code=400, detail="paths must be an array of strings")
     try:
-        return await run_in_threadpool(
+        result = await run_in_threadpool(
             control_plane.import_channel, channel, token, paths, data.get("auth_dir")
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if channel == "workbuddy":
+        asyncio.create_task(catalog.refresh_account_models("workbuddy"))
+    return result
 
 
 @app.post("/admin/accounts/scan")
@@ -1355,6 +1358,15 @@ def main():
 
     startup = control_plane.startup_scan()
     sys.stderr.write(f"[startup] discover: {startup}\n")
+
+    def _warm_account_model_lists():
+        try:
+            result = asyncio.run(catalog.refresh_account_models("workbuddy"))
+            sys.stderr.write(f"[startup] account model lists: {result}\n")
+        except Exception as exc:
+            sys.stderr.write(f"[startup] account model lists failed: {exc}\n")
+
+    threading.Thread(target=_warm_account_model_lists, daemon=True).start()
 
     accounts = db.list_accounts()
     sys.stderr.write(f"\n")

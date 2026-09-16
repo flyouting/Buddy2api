@@ -13,6 +13,7 @@ proxy.py — 请求代理转发
 import asyncio
 import json
 import os
+import re
 import time
 from typing import AsyncGenerator, Optional
 
@@ -114,6 +115,23 @@ def _is_tool_stall(body: dict, finish_reason, tool_calls: bool, text: str) -> bo
 
 def _is_retryable_status(status: int) -> bool:
     return status in RETRYABLE_STATUS_CODES or status in {401, 403}
+
+
+_MODEL_UNAVAILABLE_PATTERN = re.compile(r"service info not found|model .* not found", re.IGNORECASE)
+
+
+def _is_model_unavailable_error(detail) -> bool:
+    """上游报「该模型在这个后端不存在」：应换号重试，而不是把错误抛给客户端。"""
+    if not isinstance(detail, dict):
+        return False
+    err = detail.get("error") if isinstance(detail.get("error"), dict) else detail
+    code = err.get("code")
+    if isinstance(code, str) and code.isdigit():
+        code = int(code)
+    if code == 11102:
+        return True
+    message = err.get("message") or err.get("msg") or ""
+    return isinstance(message, str) and bool(_MODEL_UNAVAILABLE_PATTERN.search(message))
 
 
 async def _retry_delay(attempt: int):
@@ -730,7 +748,7 @@ async def proxy_chat_completions(
     last_error = None
 
     for attempt in range(max_retries):
-        account = await auth_manager.pick_account_with_fallback(tried_ids)
+        account = await auth_manager.pick_account_with_fallback(tried_ids, model=body.get("model"))
         if not account:
             break
 
@@ -765,16 +783,24 @@ async def proxy_chat_completions(
                         retry_choice = (retry_result[1].get("choices") or [{}])[0]
                         retry_message = retry_choice.get("message") or {}
                         if retry_message.get("tool_calls"):
+                            auth_manager.mark_model_available(account, attempt_body.get("model"))
                             auth_manager.mark_account_success(account["id"])
                             return retry_result
+            auth_manager.mark_model_available(account, attempt_body.get("model"))
             auth_manager.mark_account_success(account["id"])
             return result
 
         last_error = result
         err_status = result[1][0]
-        auth_manager.mark_account_failure(account["id"], err_status)
-        will_retry = _is_retryable_status(err_status) and attempt < max_retries - 1
         detail = result[1][1]
+        model_unavailable = _is_model_unavailable_error(detail)
+        if model_unavailable:
+            auth_manager.mark_model_unavailable(account, body.get("model"))
+        else:
+            auth_manager.mark_account_failure(account["id"], err_status)
+        will_retry = (
+            _is_retryable_status(err_status) or model_unavailable
+        ) and attempt < max_retries - 1
         error_message = detail
         if isinstance(detail, dict):
             error_data = detail.get("error") if isinstance(detail.get("error"), dict) else detail
@@ -863,7 +889,7 @@ async def _stream_upstream(
     pending_retry_log: dict | None = None
 
     for attempt in range(3):
-        account = await auth_manager.pick_account_with_fallback(tried_ids)
+        account = await auth_manager.pick_account_with_fallback(tried_ids, model=body.get("model"))
         if not account:
             break
         if pending_retry_log is not None:
@@ -919,8 +945,15 @@ async def _stream_upstream(
                         last_error = raw_error
                         last_error_event = None
                         last_status = response.status_code
-                        auth_manager.mark_account_failure(account["id"], response.status_code)
-                        if _is_retryable_status(response.status_code) and attempt < 2:
+                        detail = _safe_err(raw_error, response.status_code)
+                        model_unavailable = _is_model_unavailable_error(detail)
+                        if model_unavailable:
+                            auth_manager.mark_model_unavailable(account, attempt_body.get("model"))
+                        else:
+                            auth_manager.mark_account_failure(account["id"], response.status_code)
+                        if (
+                            _is_retryable_status(response.status_code) or model_unavailable
+                        ) and attempt < 2:
                             pending_retry_log = {
                                 "account": account,
                                 "prompt_tokens": 0,
@@ -1060,6 +1093,7 @@ async def _stream_upstream(
                 index: "tool_calls" if index in observer.tool_call_choices else "stop"
                 for index in missing_choices
             })
+        auth_manager.mark_model_available(account, attempt_body.get("model"))
         auth_manager.mark_account_success(account["id"])
 
         full_text = "".join(observer.content_parts)

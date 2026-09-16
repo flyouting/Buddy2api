@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 import credential_crypto
+import auth_manager
 import database as db
 import providers
 import router
@@ -556,6 +557,9 @@ def test_workbuddy_catalog_merges_accounts_and_routes_by_domain(isolated_db, mon
     assert "glm-5.2" in ids
     assert any(url.startswith("https://copilot.tencent.com") for url in requested)
     assert any(url.startswith("https://www.workbuddy.ai") for url in requested)
+
+    assert auth_manager.account_model_ids({"uid": "wb-domestic"}) == {"deepseek-v4.1-flash", "glm-5.2"}
+    assert auth_manager.account_model_ids({"uid": "wb-overseas"}) == {"gpt-5.6-sol", "glm-5.2"}
 
     monkeypatch.delenv("CB_GATEWAY_PROVIDERS", raising=False)
     assert providers.get_provider("workbuddy").accepts_model("deepseek-v4.1-flash")

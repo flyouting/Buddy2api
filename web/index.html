@@ -1024,7 +1024,19 @@ createApp({
   <div class="card" v-for="s in modelSources" :key="'cat-'+s.channel" style="margin-bottom:12px">
     <div class="card-h">{{s.display_name||s.channel}}<span class="sub">{{s.models.length}} 个模型</span><span class="badge" :class="modeClass(s)">{{modeText(s)}}</span></div>
     <div class="hint" style="padding:8px 16px">客户端使用 {{s.channel}}/模型ID{{s.channel==='workbuddy'?'，也支持裸 ID':''}}。官方目录以一键读取为准；手动项可删除。</div>
-    <table><thead><tr><th>模型 ID</th><th>名称</th><th>操作</th></tr></thead><tbody>
+    <template v-if="s.groups&&s.groups.length">
+      <div v-for="g in s.groups" :key="s.channel+'-'+g.key">
+        <div class="card-h" style="border-top:1px solid var(--border2)">{{g.label}}<span class="sub">{{g.count}} 个模型</span></div>
+        <table><thead><tr><th>模型 ID</th><th>名称</th><th>操作</th></tr></thead><tbody>
+        <tr v-for="(x,i) in g.models" :key="g.key+'-'+i">
+          <td class="mono">{{s.channel}}/{{x.id}} <span v-if="x.manual" class="tag">手动</span></td>
+          <td>{{x.name||x.id}}</td>
+          <td><button v-if="x.manual" class="btn s danger" @click="rmExtra(s.channel,x.id)">删除</button><span v-else class="muted">—</span></td>
+        </tr>
+        </tbody></table>
+      </div>
+    </template>
+    <table v-else><thead><tr><th>模型 ID</th><th>名称</th><th>操作</th></tr></thead><tbody>
     <tr v-for="(x,i) in s.models" :key="s.channel+'-'+i">
       <td class="mono">{{s.channel}}/{{x.id}} <span v-if="x.manual" class="tag">手动</span></td>
       <td>{{x.name||x.id}}</td>

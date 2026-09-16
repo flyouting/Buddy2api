@@ -323,7 +323,7 @@ def _collect_chat_proxy_stream(
 
     account = {"id": 1, "name": "test-account"}
 
-    async def pick_account(_excluded):
+    async def pick_account(_excluded, model=None):
         return account
 
     async def valid_headers(_account):
@@ -415,7 +415,7 @@ def _install_chat_account_stream_fakes(
             account_id = int(headers["X-Test-Account"])
             return FakeResponse(streams[account_id])
 
-    async def pick_account(excluded):
+    async def pick_account(excluded, model=None):
         calls["picks"].append(set(excluded))
         return next((account for account in accounts if account["id"] not in excluded), None)
 
@@ -2870,7 +2870,7 @@ def test_non_stream_proxy_fails_over_on_retryable_upstream(isolated_db, monkeypa
     account = db.get_account(account_id)
     calls = []
 
-    async def pick(exclude):
+    async def pick(exclude, model=None):
         calls.append("pick")
         return account
 
@@ -3043,7 +3043,7 @@ def test_stall_retry_nonstream_uses_tool_call_result(monkeypatch, isolated_db):
 
     account = {"id": 1, "name": "test-account"}
 
-    async def pick_account(_excluded):
+    async def pick_account(_excluded, model=None):
         return account
 
     async def valid_headers(_account):
@@ -3093,7 +3093,7 @@ def test_stall_retry_nonstream_keeps_first_answer_when_retry_has_no_tools(monkey
 
     account = {"id": 1, "name": "test-account"}
 
-    async def pick_account(_excluded):
+    async def pick_account(_excluded, model=None):
         return account
 
     async def valid_headers(_account):
@@ -3291,7 +3291,7 @@ def test_overseas_stream_request_gets_system_message(monkeypatch, isolated_db):
         "expires_at": 9_999_999_999_999,
     }
 
-    async def pick_account(excluded):
+    async def pick_account(excluded, model=None):
         return account
 
     async def valid_headers(_account):
@@ -3448,3 +3448,218 @@ def test_responses_to_chat_turns_unmatched_tool_output_into_user_context():
     assert [message["role"] for message in messages] == ["user", "assistant", "tool", "user"]
     assert messages[2]["tool_call_id"] == "call_known"
     assert messages[3]["content"] == '{"legacy": true}'
+
+
+def _seed_workbuddy_backends(domestic_priority: int = 0, overseas_priority: int = 0):
+    overseas = db.add_account({
+        "name": "overseas",
+        "uid": "wb-overseas",
+        "provider": "workbuddy",
+        "status": "active",
+        "domain": "www.workbuddy.ai",
+        "access_token": "tok-overseas",
+        "expires_at": 9_999_999_999_999,
+        "priority": overseas_priority,
+    })
+    domestic = db.add_account({
+        "name": "domestic",
+        "uid": "wb-domestic",
+        "provider": "workbuddy",
+        "status": "active",
+        "domain": "www.codebuddy.cn",
+        "access_token": "tok-domestic",
+        "expires_at": 9_999_999_999_999,
+        "priority": domestic_priority,
+    })
+    return domestic, overseas
+
+
+def test_pick_account_prefers_overseas_for_shared_models(isolated_db):
+    auth_manager._sticky_account_id.clear()
+    _seed_workbuddy_backends()
+
+    account = auth_manager.pick_account(model="deepseek-v4.1-flash")
+
+    assert account["domain"] == "www.workbuddy.ai"
+
+
+def test_pick_account_skips_account_that_cannot_serve_model(isolated_db):
+    auth_manager._sticky_account_id.clear()
+    _seed_workbuddy_backends()
+    auth_manager.mark_model_unavailable({"uid": "wb-overseas"}, "glm-5.3-flash")
+
+    account = auth_manager.pick_account(model="glm-5.3-flash")
+
+    assert account["domain"] == "www.codebuddy.cn"
+
+
+def test_pick_account_respects_priority_over_overseas_preference(isolated_db):
+    auth_manager._sticky_account_id.clear()
+    _seed_workbuddy_backends(domestic_priority=5)
+
+    account = auth_manager.pick_account(model="auto")
+
+    assert account["domain"] == "www.codebuddy.cn"
+
+
+def test_is_model_unavailable_error_detection():
+    assert proxy._is_model_unavailable_error({
+        "code": 11102,
+        "msg": "model [glm-5.3-flash] service info not found",
+    })
+    assert proxy._is_model_unavailable_error({
+        "error": {"message": "model [gpt-5.6-sol] service info not found"}
+    })
+    assert not proxy._is_model_unavailable_error({
+        "code": 11128,
+        "msg": "first message is not system prompt",
+    })
+    assert not proxy._is_model_unavailable_error("plain text")
+
+
+def test_chat_failover_on_model_unavailable(monkeypatch, isolated_db):
+    auth_manager._sticky_account_id.clear()
+    _seed_workbuddy_backends()
+    seen = []
+
+    async def fake_collect(url, headers, body, account, api_key_info, model_name, t0):
+        seen.append(account["domain"])
+        if account["domain"] == "www.workbuddy.ai":
+            return ("error", (400, {
+                "code": 11102,
+                "msg": "model [glm-5.3-flash] service info not found",
+            }))
+        return ("json", {
+            "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+            "model": body.get("model"),
+            "usage": {},
+        })
+
+    async def valid_headers(_account):
+        return {"Authorization": "Bearer test"}
+
+    async def no_delay(_attempt):
+        return None
+
+    monkeypatch.setattr(auth_manager, "get_valid_headers", valid_headers)
+    monkeypatch.setattr(proxy, "_collect_stream", fake_collect)
+    monkeypatch.setattr(proxy, "_log_request", lambda *args, **kwargs: None)
+    monkeypatch.setattr(proxy, "_retry_delay", no_delay)
+
+    async def run():
+        return await proxy.proxy_chat_completions(
+            {"model": "glm-5.3-flash", "messages": [{"role": "user", "content": "hi"}]},
+            None,
+        )
+
+    result = asyncio.run(run())
+
+    assert result[0] == "json"
+    assert seen == ["www.workbuddy.ai", "www.codebuddy.cn"]
+    assert auth_manager.model_is_unavailable({"uid": "wb-overseas"}, "glm-5.3-flash")
+    assert not auth_manager.model_is_unavailable({"uid": "wb-domestic"}, "glm-5.3-flash")
+
+
+def test_pick_account_returns_to_overseas_after_deny_expires(isolated_db, monkeypatch):
+    auth_manager._sticky_account_id.clear()
+    _seed_workbuddy_backends()
+    auth_manager.mark_model_unavailable({"uid": "wb-overseas"}, "glm-5.3-flash")
+
+    import time as _time
+    monkeypatch.setattr(_time, "time", lambda: 9_999_999_999)
+    account = auth_manager.pick_account(model="glm-5.3-flash")
+
+    assert account["domain"] == "www.workbuddy.ai"
+
+
+def test_pick_account_routes_by_supplier_model_lists(isolated_db):
+    auth_manager._sticky_account_id.clear()
+    _seed_workbuddy_backends()
+    auth_manager.save_account_models(
+        {"uid": "wb-domestic"}, [{"id": "glm-5.3-flash"}, {"id": "auto"}]
+    )
+    auth_manager.save_account_models(
+        {"uid": "wb-overseas"}, [{"id": "gpt-5.6-sol"}, {"id": "glm-5.2"}]
+    )
+
+    auth_manager._sticky_account_id.clear()
+    assert auth_manager.pick_account(model="glm-5.3-flash")["domain"] == "www.codebuddy.cn"
+
+    auth_manager._sticky_account_id.clear()
+    assert auth_manager.pick_account(model="gpt-5.6-sol")["domain"] == "www.workbuddy.ai"
+
+    auth_manager._sticky_account_id.clear()
+    assert auth_manager.pick_account(model="glm-5.2")["domain"] == "www.workbuddy.ai"
+
+    auth_manager._sticky_account_id.clear()
+    assert auth_manager.pick_account(model="brand-new-model")["domain"] == "www.workbuddy.ai"
+
+
+def test_learned_available_model_routes_to_overseas(isolated_db):
+    auth_manager._sticky_account_id.clear()
+    _seed_workbuddy_backends()
+    auth_manager.save_account_models({"uid": "wb-domestic"}, [{"id": "deepseek-v4.1-flash"}])
+
+    auth_manager._sticky_account_id.clear()
+    assert auth_manager.pick_account(model="deepseek-v4.1-flash")["domain"] == "www.codebuddy.cn"
+
+    auth_manager.mark_model_available({"uid": "wb-overseas"}, "deepseek-v4.1-flash")
+    auth_manager._sticky_account_id.clear()
+    assert auth_manager.pick_account(model="deepseek-v4.1-flash")["domain"] == "www.workbuddy.ai"
+
+
+def test_model_unavailable_clears_learned_available(isolated_db):
+    auth_manager.mark_model_available({"uid": "wb-overseas"}, "glm-5.3-flash")
+    assert "glm-5.3-flash" in (auth_manager.account_model_ids({"uid": "wb-overseas"}) or set())
+
+    auth_manager.mark_model_unavailable({"uid": "wb-overseas"}, "glm-5.3-flash")
+
+    assert "glm-5.3-flash" not in (auth_manager.account_model_ids({"uid": "wb-overseas"}) or set())
+
+
+def test_mark_model_available_clears_deny(isolated_db):
+    auth_manager.mark_model_unavailable({"uid": "wb-overseas"}, "deepseek-v4.1-flash")
+    assert auth_manager.model_is_unavailable({"uid": "wb-overseas"}, "deepseek-v4.1-flash")
+
+    auth_manager.mark_model_available({"uid": "wb-overseas"}, "deepseek-v4.1-flash")
+
+    assert not auth_manager.model_is_unavailable({"uid": "wb-overseas"}, "deepseek-v4.1-flash")
+
+
+def test_catalog_snapshot_groups_workbuddy_backends(isolated_db, monkeypatch):
+    import catalog
+
+    monkeypatch.setenv("CB_GATEWAY_PROVIDERS", "workbuddy")
+    _seed_workbuddy_backends()
+    auth_manager.save_account_models(
+        {"uid": "wb-domestic"}, [{"id": "glm-5.3-flash"}, {"id": "glm-5.2"}]
+    )
+    auth_manager.save_account_models(
+        {"uid": "wb-overseas"}, [{"id": "gpt-5.6-sol"}, {"id": "glm-5.2"}]
+    )
+    catalog.save_catalog(
+        "workbuddy",
+        [
+            {"id": "glm-5.3-flash", "name": "GLM-5.3-Flash"},
+            {"id": "gpt-5.6-sol", "name": "GPT-5.6-Sol"},
+            {"id": "glm-5.2", "name": "GLM-5.2"},
+        ],
+    )
+    catalog.upsert_model("workbuddy", "manual-model", "手动模型")
+
+    snap = catalog.catalog_snapshot()
+    source = next(s for s in snap["sources"] if s["channel"] == "workbuddy")
+    groups = {g["key"]: g for g in source["groups"]}
+
+    overseas_ids = {m["id"] for m in groups["workbuddy"]["models"]}
+    domestic_ids = {m["id"] for m in groups["codebuddy"]["models"]}
+    manual_ids = {m["id"] for m in groups["manual"]["models"]}
+
+    assert "gpt-5.6-sol" in overseas_ids
+    assert "glm-5.3-flash" in domestic_ids
+    assert "glm-5.2" in overseas_ids and "glm-5.2" in domestic_ids
+    assert "manual-model" in manual_ids
+    assert "gpt-5.6-sol" not in domestic_ids
+    assert "glm-5.3-flash" not in overseas_ids
+
+    monkeypatch.delenv("CB_GATEWAY_PROVIDERS", raising=False)
