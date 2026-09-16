@@ -3397,3 +3397,54 @@ def test_responses_to_chat_keeps_assistant_text_without_tools():
     assert [message["role"] for message in messages] == ["user", "assistant", "user"]
     assert messages[1]["content"] == "你好！"
     assert "tool_calls" not in messages[1]
+
+
+def test_responses_to_chat_turns_orphan_tool_output_into_user_context():
+    payload = {
+        "input": [
+            {"type": "message", "role": "developer", "content": "You are Codex."},
+            {"type": "message", "role": "user", "content": "跑每日任务"},
+            {
+                "type": "function_call_output",
+                "name": "automation_update",
+                "output": "Automation: daily report\nLast run: yesterday",
+            },
+            {"type": "message", "role": "user", "content": "继续"},
+        ],
+    }
+
+    messages = responses.responses_to_chat(payload)["messages"]
+
+    assert [message["role"] for message in messages] == ["system", "user", "user", "user"]
+    assert messages[2]["content"] == "Automation: daily report\nLast run: yesterday"
+    assert "tool_call_id" not in messages[2]
+
+
+def test_responses_to_chat_turns_unmatched_tool_output_into_user_context():
+    payload = {
+        "input": [
+            {"type": "message", "role": "user", "content": "跑工具"},
+            {
+                "type": "function_call",
+                "call_id": "call_known",
+                "name": "exec_command",
+                "arguments": "{}",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_known",
+                "output": "ok",
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_unknown",
+                "output": {"legacy": True},
+            },
+        ],
+    }
+
+    messages = responses.responses_to_chat(payload)["messages"]
+
+    assert [message["role"] for message in messages] == ["user", "assistant", "tool", "user"]
+    assert messages[2]["tool_call_id"] == "call_known"
+    assert messages[3]["content"] == '{"legacy": true}'

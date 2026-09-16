@@ -160,6 +160,7 @@ def responses_to_chat(resp_payload: dict) -> dict:
     inp = resp_payload.get("input")
     if isinstance(inp, list):
         pending_tool_calls = []
+        seen_call_ids: set[str] = set()
 
         def flush_pending_tool_calls():
             nonlocal pending_tool_calls
@@ -185,6 +186,22 @@ def responses_to_chat(resp_payload: dict) -> dict:
             pending_tool_calls = []
 
         for item in inp:
+            if isinstance(item, dict):
+                item_kind = item.get("type")
+                if item_kind == "function_call":
+                    call_id = str(item.get("call_id") or item.get("id") or "").strip()
+                    if call_id:
+                        seen_call_ids.add(call_id)
+                elif item_kind == "function_call_output":
+                    call_id = str(item.get("call_id") or "").strip()
+                    if not call_id or call_id not in seen_call_ids:
+                        flush_pending_tool_calls()
+                        output = item.get("output", "")
+                        if isinstance(output, dict):
+                            output = json.dumps(output)
+                        messages.append({"role": "user", "content": str(output)})
+                        continue
+
             chat_msg = _input_item_to_chat_message(item)
             if not chat_msg:
                 continue
