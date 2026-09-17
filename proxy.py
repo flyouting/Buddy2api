@@ -1425,6 +1425,7 @@ async def _collect_stream(
     model: str | None = None
     finish_reason: str | None = None
     usage: dict | None = None
+    seen_done = False
 
     try:
         async with httpx.AsyncClient(timeout=auth_manager.request_timeout(300)) as c:
@@ -1440,6 +1441,7 @@ async def _collect_stream(
                         continue
                     data = line[5:].strip()
                     if data == "[DONE]":
+                        seen_done = True
                         break
                     try:
                         chunk = json.loads(data)
@@ -1469,6 +1471,12 @@ async def _collect_stream(
     except httpx.HTTPError as e:
         return ("error", (502, {"error": {"message": f"upstream error: {e}", "type": "upstream_error"}}))
 
+    if not seen_done and not finish_reason:
+        return (
+            "error",
+            (502, {"error": {"message": "The upstream stream ended without [DONE] or a finish reason.", "type": "upstream_error"}}),
+        )
+
     tcs = None
     if tool_calls:
         tcs = [
@@ -1477,6 +1485,15 @@ async def _collect_stream(
             for _, v in sorted(tool_calls.items())
         ]
         finish_reason = finish_reason or "tool_calls"
+
+    if (
+        finish_reason is None
+        and not tool_calls
+    ):
+        return (
+            "error",
+            (502, {"error": {"message": "The upstream stream ended before a finish reason.", "type": "upstream_error"}}),
+        )
 
     if (
         not content_parts

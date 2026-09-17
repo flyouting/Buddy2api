@@ -84,6 +84,8 @@ Unprefixed `auto` follows the key’s channel. Use a separate key per channel. O
 
 ### Reasoning effort
 
+WorkBuddy's collected responses, including the default tool-stall retry path, reject partial text without completion metadata instead of synthesizing a successful `stop`. An explicit `finish_reason` followed by EOF remains valid without `[DONE]`. A `[DONE]` event alone does not make text without a finish reason complete. This validation does not determine whether a model's explicit `stop` is premature or resolve every long-session stall.
+
 Agent clients can send top-level `reasoning_effort` to Chat Completions and the standard `reasoning: {"effort": "high"}` object to Responses. Compatibility forms used by OpenCode, DSH, Cherry, and Claude-style clients are also accepted: `reasoning.effort`, `reasoningEffort`, `thinking.type`, `thinking.effort`, `output_config.effort`, and `enable_thinking`. Accepted levels are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`; `off` is an alias for `none`.
 
 | Channel | Effective capability |

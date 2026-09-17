@@ -1,6 +1,7 @@
 import asyncio
 import json
 import sqlite3
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -3359,6 +3360,46 @@ def test_stall_detection_ack_text():
     assert proxy._request_has_tool_loop(body)
     assert proxy._looks_like_stall_text("好的，马上继续跑流程。")
     assert proxy._is_tool_stall(body, "stop", False, "好的，马上继续跑流程。")
+
+
+@pytest.mark.parametrize("terminal,done,valid", [(None, False, False), (None, True, False), ("stop", False, True), ("stop", True, True), ("length", False, True)])
+def test_nonstream_collection_validates_completion(monkeypatch, isolated_db, terminal, done, valid):
+    class Response:
+        status_code = 200
+
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
+
+        async def aiter_lines(self):
+            yield "data: " + json.dumps({"choices": [{"delta": {"content": "answer"}, "finish_reason": terminal}]})
+            if done:
+                yield "data: [DONE]"
+
+    class Client:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): return False
+        def stream(self, *args, **kwargs): return Response()
+
+    monkeypatch.setattr(proxy.httpx, "AsyncClient", Client)
+    result = asyncio.run(proxy._collect_stream(
+        "https://upstream.test", {}, {}, {"id": 1}, None, "test", time.time()
+    ))
+    if valid:
+        assert result[0] == "json"
+        assert result[1]["choices"][0]["finish_reason"] == terminal
+    else:
+        assert result[0] == "error"
+        assert result[1][0] == 502
+        assert "finish reason" in result[1][1]["error"]["message"]
+
+
+def test_stall_detection_short_english_ack():
+    body = _tool_loop_body()
+    assert proxy._looks_like_stall_text("OK.")
+    assert proxy._looks_like_stall_text("Got it, continuing.")
+    assert proxy._is_tool_stall(body, "stop", False, "Let me write it.")
+    assert not proxy._looks_like_stall_text("In summary, the three files are done.")
 
 
 def test_stall_detection_rejects_summary():

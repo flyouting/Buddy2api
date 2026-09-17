@@ -130,6 +130,8 @@ python server.py
 
 ## 常见问题
 
+- WorkBuddy 聚合响应（包括默认停转重试所用的工具续聊路径）在缺少完成标记时返回上游错误，不再把部分正文默认为正常 `stop`。明确的 `finish_reason` 后直接 EOF 仍被接受；仅收到 `[DONE]`、但正文没有结束原因时不会当作正常完成。此校验不能判定模型主动 `stop` 是否过早，也不保证解决所有长会话停转。
+
 - `git` 或 `conda` 不是内部命令：关掉终端重开；Conda 用户改用 Miniconda Prompt。
 - `No module named ...`：先 `conda activate buddy2api`，再 `python -m pip install -r requirements.txt`。
 - 下载依赖很慢：确认能访问 PyPI，不要混用好几个 Python。
