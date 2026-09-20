@@ -725,6 +725,47 @@ def test_responses_to_chat_keeps_text_only_message_content_as_string():
     assert chat_payload["messages"][0]["content"] == "hello"
 
 
+def test_responses_keeps_tool_results_contiguous():
+    messages = responses.responses_to_chat({
+        "model": "deepseek-v4-flash",
+        "input": [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "go"}]},
+            {"type": "function_call", "call_id": "call_a", "name": "view_image", "arguments": "{}"},
+            {"type": "function_call", "call_id": "call_b", "name": "view_image", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_a", "output": "[image]"},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "<resize notice>"}]},
+            {"type": "function_call_output", "call_id": "call_b", "output": "[image]"},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "<resize notice 2>"}]},
+        ],
+    })["messages"]
+
+    # tool 结果必须紧贴 assistant(tool_calls)；中间的 developer 通知排到块后
+    assert [m["role"] for m in messages] == [
+        "user", "assistant", "tool", "tool", "system", "system",
+    ]
+    assert [m["tool_call_id"] for m in messages if m["role"] == "tool"] == ["call_a", "call_b"]
+    assert messages[-2]["content"] == "<resize notice>"
+    assert messages[-1]["content"] == "<resize notice 2>"
+
+
+def test_responses_tool_output_images_become_multimodal_parts():
+    messages = responses.responses_to_chat({
+        "model": "deepseek-v4-flash",
+        "input": [
+            {"type": "function_call", "call_id": "call_x", "name": "view_image", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_x", "output": [
+                {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "high"},
+            ]},
+        ],
+    })["messages"]
+
+    assert messages[0]["role"] == "assistant"
+    assert messages[1]["role"] == "tool"
+    assert messages[1]["content"] == [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc", "detail": "high"}},
+    ]
+
+
 @pytest.mark.parametrize(
     "effort",
     ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],

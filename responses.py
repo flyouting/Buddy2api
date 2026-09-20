@@ -161,11 +161,26 @@ def responses_to_chat(resp_payload: dict) -> dict:
     if isinstance(inp, list):
         pending_tool_calls = []
         seen_call_ids: set[str] = set()
+        # 已发出但还没收到结果的 tool_call id 队列。Chat Completions（以及本
+        # 上游）要求 tool 结果必须紧跟 assistant(tool_calls) 且不能被其它消息
+        # 打断，否则 400 code 11148 "tool calls and tool results do not match"。
+        awaiting_tool_ids: list[str] = []
+        # tool 块未闭合期间，其它消息先在这里排队，块闭合后按原顺序放行。
+        deferred_messages: list[dict] = []
+
+        def drain_deferred_messages():
+            while deferred_messages:
+                messages.append(deferred_messages.pop(0))
 
         def flush_pending_tool_calls():
-            nonlocal pending_tool_calls
+            nonlocal pending_tool_calls, awaiting_tool_ids
             if not pending_tool_calls:
                 return
+            # 上一组 tool_calls 若始终没等到结果就被新回合打断，先放行被它
+            # 挡下的消息，避免后续对话永远被压住（缺结果本身已无法补救）。
+            if awaiting_tool_ids:
+                awaiting_tool_ids = []
+                drain_deferred_messages()
             prior = messages[-1] if messages else None
             if (
                 isinstance(prior, dict)
@@ -175,6 +190,11 @@ def responses_to_chat(resp_payload: dict) -> dict:
                 content = prior.get("content")
                 if isinstance(content, str) and content.strip():
                     prior["tool_calls"] = pending_tool_calls
+                    awaiting_tool_ids = [
+                        str(call.get("id") or "")
+                        for call in pending_tool_calls
+                        if call.get("id")
+                    ]
                     pending_tool_calls = []
                     return
                 messages.pop()
@@ -183,6 +203,11 @@ def responses_to_chat(resp_payload: dict) -> dict:
                 "content": None,
                 "tool_calls": pending_tool_calls,
             })
+            awaiting_tool_ids = [
+                str(call.get("id") or "")
+                for call in pending_tool_calls
+                if call.get("id")
+            ]
             pending_tool_calls = []
 
         for item in inp:
@@ -196,10 +221,14 @@ def responses_to_chat(resp_payload: dict) -> dict:
                     call_id = str(item.get("call_id") or "").strip()
                     if not call_id or call_id not in seen_call_ids:
                         flush_pending_tool_calls()
-                        output = item.get("output", "")
-                        if isinstance(output, dict):
-                            output = json.dumps(output)
-                        messages.append({"role": "user", "content": str(output)})
+                        orphan = {
+                            "role": "user",
+                            "content": _tool_output_to_content(item.get("output", "")),
+                        }
+                        if awaiting_tool_ids:
+                            deferred_messages.append(orphan)
+                        else:
+                            messages.append(orphan)
                         continue
 
             chat_msg = _input_item_to_chat_message(item)
@@ -215,6 +244,24 @@ def responses_to_chat(resp_payload: dict) -> dict:
 
             flush_pending_tool_calls()
 
+            # tool 结果必须紧贴 assistant(tool_calls)，中间不能插入其它消息。
+            if chat_msg.get("role") == "tool":
+                call_id = str(chat_msg.get("tool_call_id") or "")
+                if call_id and call_id in awaiting_tool_ids:
+                    messages.append(chat_msg)
+                    awaiting_tool_ids.remove(call_id)
+                    if not awaiting_tool_ids:
+                        drain_deferred_messages()
+                else:
+                    # 重复/悬空的 tool 结果降级为 user 消息，避免打断 tool 序列
+                    messages.append({"role": "user", "content": chat_msg.get("content")})
+                continue
+
+            # 当前 tool 块还没收齐结果：普通消息先排队，块闭合后再按原顺序放行
+            if awaiting_tool_ids:
+                deferred_messages.append(chat_msg)
+                continue
+
             # 清洗 system/developer 消息
             if chat_msg.get("role") in ("system", "developer"):
                 chat_msg["role"] = "system"
@@ -225,6 +272,9 @@ def responses_to_chat(resp_payload: dict) -> dict:
             messages.append(chat_msg)
 
         flush_pending_tool_calls()
+        # 会话尾部若有悬空 tool 块，放行被它挡下的消息
+        awaiting_tool_ids = []
+        drain_deferred_messages()
     elif isinstance(inp, str) and inp.strip():
         messages.append({"role": "user", "content": inp})
 
@@ -319,10 +369,11 @@ def _input_item_to_chat_message(item) -> Optional[dict]:
 
     elif kind == "function_call_output":
         call_id = item.get("call_id", "")
-        output = item.get("output", "")
-        if isinstance(output, dict):
-            output = json.dumps(output)
-        return {"role": "tool", "tool_call_id": call_id, "content": str(output)}
+        return {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "content": _tool_output_to_content(item.get("output", "")),
+        }
 
     elif kind == "function_call":
         # 历史 function_call in input（罕见，保留）
@@ -432,6 +483,20 @@ def _content_to_chat(content):
     if not has_image:
         return "\n".join(str(part.get("text", "")) for part in parts)
     return parts
+
+
+def _tool_output_to_content(output):
+    """tool 输出 → Chat content。
+
+    Codex 的 view_image 等工具会把图片放在 output 里
+    （[{type: input_image, image_url: data:...}]）；必须按多模态 parts 透传，
+    不能 str() 成含 base64 的文本——那既撑爆上下文，模型也看不到图。
+    """
+    if isinstance(output, dict):
+        output = json.dumps(output)
+    if isinstance(output, (str, list)):
+        return _content_to_chat(output)
+    return str(output)
 
 # 触发腾讯内容审核的关键词及替换映射
 # 设计原则：只替换确实会触发腾讯内容审核、且替换后不影响 codex 指令语义的词。
