@@ -311,7 +311,7 @@ def _input_item_to_chat_message(item) -> Optional[dict]:
         # Codex 可能发送 "developer" 角色，映射为 system
         if role == "developer":
             role = "system"
-        content = _flatten_content(item.get("content"))
+        content = _content_to_chat(item.get("content"))
         msg = {"role": role, "content": content}
         if item.get("name"):
             msg["name"] = item["name"]
@@ -345,7 +345,7 @@ def _input_item_to_chat_message(item) -> Optional[dict]:
 
     else:
         # 未知类型：尝试作为 user message 处理
-        content = _flatten_content(item.get("content"))
+        content = _content_to_chat(item.get("content"))
         if content:
             return {"role": "user", "content": content}
         return None
@@ -367,9 +367,10 @@ def _flatten_content(content) -> str:
                 if pt in ("input_text", "output_text", "text"):
                     parts.append(str(p.get("text", "")))
                 elif pt == "image_url" or pt == "input_image":
-                    url = p.get("image_url", "")
-                    url_str = url.get("url", "") if isinstance(url, dict) else str(url)
-                    parts.append(f"[image: {url_str}]")
+                    # 文本化路径只保留占位符：绝不能把 base64 data URI 当文本
+                    # 塞进 prompt（曾导致上下文按几十万 token/张图计算而报
+                    # "prompt is too long"）。真正转发图片请用 _content_to_chat()。
+                    parts.append("[image]")
                 elif pt == "file":
                     parts.append("[file]")
                 else:
@@ -378,6 +379,59 @@ def _flatten_content(content) -> str:
     if isinstance(content, dict):
         return str(content.get("text", str(content)))
     return str(content)
+
+
+def _image_part_to_chat(part: dict) -> Optional[dict]:
+    """Responses image part → Chat Completions image_url part。"""
+    url = part.get("image_url", part.get("url", ""))
+    if isinstance(url, dict):
+        url_str = url.get("url", "")
+        detail = part.get("detail") or url.get("detail")
+    else:
+        url_str = str(url or "")
+        detail = part.get("detail")
+    if not url_str:
+        return None
+    image: dict = {"url": url_str}
+    if detail:
+        image["detail"] = detail
+    return {"type": "image_url", "image_url": image}
+
+
+def _content_to_chat(content):
+    """Responses content → Chat Completions content（图片透传版本）。
+
+    - 无图片：返回字符串，与旧行为一致，避免影响其它客户端与工具链路。
+    - 含图片：返回 OpenAI Chat 多模态 parts 列表，图片以 image_url 原样
+      交给上游处理（上游支持 data URI）。上游按图片计费/token，而不是把
+      base64 当文本逐字符计入上下文。
+    """
+    if not isinstance(content, list):
+        return _flatten_content(content)
+    parts: list[dict] = []
+    has_image = False
+    for p in content:
+        if isinstance(p, str):
+            parts.append({"type": "text", "text": p})
+        elif isinstance(p, dict):
+            pt = p.get("type", "")
+            if pt in ("input_text", "output_text", "text"):
+                parts.append({"type": "text", "text": str(p.get("text", ""))})
+            elif pt in ("image_url", "input_image"):
+                image_part = _image_part_to_chat(p)
+                if image_part is None:
+                    continue
+                parts.append(image_part)
+                has_image = True
+            elif pt == "file":
+                parts.append({"type": "text", "text": "[file]"})
+            else:
+                parts.append({"type": "text", "text": str(p.get("text", p))})
+        else:
+            parts.append({"type": "text", "text": str(p)})
+    if not has_image:
+        return "\n".join(str(part.get("text", "")) for part in parts)
+    return parts
 
 # 触发腾讯内容审核的关键词及替换映射
 # 设计原则：只替换确实会触发腾讯内容审核、且替换后不影响 codex 指令语义的词。

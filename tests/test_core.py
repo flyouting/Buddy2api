@@ -683,11 +683,46 @@ def test_http_endpoints_reject_invalid_reasoning_controls(
     assert error.value.detail["error"]["code"] == "invalid_reasoning_control"
 
 
-def test_responses_input_image_string_is_preserved():
+def test_responses_flatten_uses_short_image_placeholder():
     flattened = responses._flatten_content(
         [{"type": "input_image", "image_url": "data:image/png;base64,abc"}]
     )
-    assert "data:image/png;base64,abc" in flattened
+    assert flattened == "[image]"
+
+
+def test_responses_to_chat_forwards_image_as_multimodal_part():
+    chat_payload = responses.responses_to_chat({
+        "model": "deepseek-v4-flash",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "what is this?"},
+                {"type": "input_image", "image_url": "data:image/png;base64,abc"},
+            ],
+        }],
+    })
+
+    content = chat_payload["messages"][0]["content"]
+    assert isinstance(content, list)
+    assert content[0] == {"type": "text", "text": "what is this?"}
+    assert content[1] == {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,abc"},
+    }
+
+
+def test_responses_to_chat_keeps_text_only_message_content_as_string():
+    chat_payload = responses.responses_to_chat({
+        "model": "deepseek-v4-flash",
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+        }],
+    })
+
+    assert chat_payload["messages"][0]["content"] == "hello"
 
 
 @pytest.mark.parametrize(
