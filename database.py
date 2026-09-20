@@ -384,6 +384,7 @@ def _migrate_daily_usage(conn: sqlite3.Connection):
         SELECT api_key_id, date(created_at, 'unixepoch', 'localtime'), COUNT(*)
         FROM logs
         WHERE api_key_id IS NOT NULL AND created_at >= ?
+          AND api_key_id IN (SELECT id FROM api_keys)
         GROUP BY api_key_id, date(created_at, 'unixepoch', 'localtime')
         ON CONFLICT(api_key_id, usage_date) DO UPDATE SET
             request_count=MAX(api_key_daily_usage.request_count, excluded.request_count)
@@ -709,6 +710,11 @@ def update_api_key(kid: int, data: dict):
 def delete_api_key(kid: int):
     with _lock:
         conn = get_conn()
+        # logs.api_key_id 不是外键，直接删 key 会留下孤儿行，
+        # 会让下次启动的 api_key_daily_usage 迁移因外键约束失败。
+        conn.execute(
+            "UPDATE logs SET api_key_id=NULL WHERE api_key_id=?", (kid,)
+        )
         conn.execute("DELETE FROM api_keys WHERE id=?", (kid,))
         conn.commit()
         conn.close()
