@@ -766,6 +766,121 @@ def test_responses_tool_output_images_become_multimodal_parts():
     ]
 
 
+def _img_msg(text: str, image_id: str) -> dict:
+    return {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": text},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64," + image_id * 100}},
+        ],
+    }
+
+
+def test_image_budget_drops_oldest_images_first():
+    messages = [_img_msg(f"pic {i}", chr(ord("a") + i)) for i in range(4)]
+
+    out = proxy.apply_image_budget(messages, max_bytes=250)
+
+    # 最老的两张被替换为占位符（折叠成字符串），最新的两张保留
+    assert out[0]["content"] == "pic 0\n[image omitted]"
+    assert out[1]["content"] == "pic 1\n[image omitted]"
+    for kept in (out[2], out[3]):
+        assert isinstance(kept["content"], list)
+        assert kept["content"][1]["type"] == "image_url"
+    # 原始消息不被就地修改
+    assert messages[0]["content"][1]["type"] == "image_url"
+
+
+def test_image_budget_collapses_tool_message_parts():
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "view_image", "arguments": "{}"}}],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "c1",
+            "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + "x" * 100}}],
+        },
+        _img_msg("latest", "y"),
+    ]
+
+    out = proxy.apply_image_budget(messages, max_bytes=120)
+
+    assert out[1]["content"] == "[image omitted]"
+    assert isinstance(out[2]["content"], list)
+    assert out[2]["content"][1]["type"] == "image_url"
+
+
+def test_image_budget_zero_disables_trimming():
+    messages = [_img_msg("pic", "a")]
+    assert proxy.apply_image_budget(messages, max_bytes=0) is messages
+
+
+def _noise_png_data_uri(width: int, height: int, *, step: int = 7) -> str:
+    Image = pytest.importorskip("PIL.Image")
+    import base64
+    import io
+
+    img = Image.new("RGB", (width, height))
+    px = img.load()
+    for x in range(0, width, step):
+        for y in range(0, height, step):
+            px[x, y] = ((x * 13) % 256, (y * 7) % 256, (x * y) % 256)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+
+def test_image_compression_downscales_oversized_data_uri():
+    import base64
+    import io
+
+    Image = pytest.importorskip("PIL.Image")
+    uri = _noise_png_data_uri(2000, 1500)
+
+    out = proxy._compress_data_uri(uri)
+
+    assert out != uri
+    assert out.startswith("data:image/jpeg;base64,")
+    assert len(out) < len(uri)
+    with Image.open(io.BytesIO(base64.b64decode(out.split(",", 1)[1]))) as compressed:
+        assert max(compressed.size) <= 1080
+
+
+def test_image_compression_skips_images_within_limits():
+    uri = _noise_png_data_uri(320, 200)
+    assert proxy._compress_data_uri(uri) == uri
+
+
+def test_image_compression_result_is_cached():
+    uri = _noise_png_data_uri(2000, 1500)
+    first = proxy._compress_data_uri_cached(uri)
+    second = proxy._compress_data_uri_cached(uri)
+    assert first == second
+    assert first != uri
+
+
+def test_build_backend_body_compresses_message_images():
+    uri = _noise_png_data_uri(2000, 1500)
+    body = proxy.build_backend_body({
+        "model": "deepseek-v4-flash",
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": uri}},
+            ],
+        }],
+        "stream": False,
+    })
+
+    compressed_uri = body["messages"][0]["content"][1]["image_url"]["url"]
+    assert compressed_uri.startswith("data:image/jpeg;base64,")
+    assert len(compressed_uri) < len(uri)
+
+
 @pytest.mark.parametrize(
     "effort",
     ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],

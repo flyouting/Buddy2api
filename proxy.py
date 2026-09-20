@@ -11,10 +11,17 @@ proxy.py — 请求代理转发
 """
 
 import asyncio
+import base64
+import hashlib
+import io
 import json
 import os
 import re
+import sys
+import threading
 import time
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncGenerator, Optional
 
 import httpx
@@ -229,12 +236,242 @@ def _configured_reasoning_default(model: str) -> str | None:
     return value if value in _VALID_REASONING_DEFAULTS else None
 
 
+def _image_budget_bytes() -> int:
+    """历史图片总预算（字节）。0 表示不限制。"""
+    raw = os.environ.get("CB_GATEWAY_MAX_IMAGE_BYTES", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return 12 * 1024 * 1024
+
+
+def apply_image_budget(messages: list, max_bytes: int | None = None) -> list:
+    """把历史图片总量限制在预算内，超限时从最老的图片开始替换为占位符。
+
+    Codex 每轮都会全量重发整个会话（包含每次 view_image 得到的图片），
+    不做限制时请求体会随着图片历史无限增长，先把网关 body 上限（413）撞掉，
+    再往后还会撞上游自己的上限。这里做兜底：保留最新的图片，淘汰最老的，
+    模型需要旧图时可以重新调用工具读取。
+    """
+    if max_bytes is None:
+        max_bytes = _image_budget_bytes()
+    if max_bytes <= 0 or not isinstance(messages, list):
+        return messages
+
+    refs: list[tuple[int, int, int]] = []
+    total = 0
+    for mi, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for pi, part in enumerate(content):
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                url = part.get("image_url")
+                size = len(url.get("url", "")) if isinstance(url, dict) else len(str(url))
+                refs.append((mi, pi, size))
+                total += size
+
+    if total <= max_bytes or len(refs) <= 1:
+        return messages
+
+    replace_at: dict[int, set[int]] = {}
+    dropped_count = 0
+    dropped_bytes = 0
+    for mi, pi, size in refs[:-1]:  # 至少保留最新的一张图片
+        if total - dropped_bytes <= max_bytes:
+            break
+        replace_at.setdefault(mi, set()).add(pi)
+        dropped_bytes += size
+        dropped_count += 1
+
+    if not replace_at:
+        return messages
+
+    out: list = []
+    for mi, msg in enumerate(messages):
+        if mi not in replace_at or not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        new_content = list(msg.get("content") or [])
+        for pi in replace_at[mi]:
+            if 0 <= pi < len(new_content):
+                new_content[pi] = {"type": "text", "text": "[image omitted]"}
+        if new_content and all(
+            isinstance(p, dict) and p.get("type") == "text" for p in new_content
+        ):
+            # 没有图片了：折叠成字符串，保持与普通文本消息一致
+            new_content = "\n".join(str(p.get("text", "")) for p in new_content)
+        out.append({**msg, "content": new_content})
+
+    print(
+        f"[proxy] image budget: dropped {dropped_count} image(s) "
+        f"({dropped_bytes / 1048576:.1f} MB), budget {max_bytes / 1048576:.1f} MB",
+        file=sys.stderr,
+    )
+    return out
+
+
+def _image_max_dim() -> int:
+    """图片最长边上限（对齐官方客户端 maxDimension=1080）。0 表示不压缩。"""
+    raw = os.environ.get("CB_GATEWAY_IMAGE_MAX_DIM", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return 1080
+
+
+def _image_jpeg_quality() -> int:
+    raw = os.environ.get("CB_GATEWAY_IMAGE_JPEG_QUALITY", "").strip()
+    if raw:
+        try:
+            return min(95, max(1, int(raw)))
+        except ValueError:
+            pass
+    return 85
+
+
+def _compress_data_uri(uri: str) -> str:
+    """把 data URI 图片缩到最长边 max_dim 并转 JPEG；不划算或无法识别时原样返回。
+
+    对齐 WorkBuddy AI 官方客户端的 ImageCompressionInterceptor：
+    逐张检查 input_image，超过尺寸上限时压缩，尺寸已在内则跳过。
+    """
+    max_dim = _image_max_dim()
+    if max_dim <= 0 or not isinstance(uri, str):
+        return uri
+    header, sep, payload = uri.partition(",")
+    if not sep or not header.startswith("data:image/") or ";base64" not in header:
+        return uri
+    if len(payload) < 64 * 1024:  # 小图不值得重新编码
+        return uri
+    try:
+        from PIL import Image  # 延迟导入：没装 Pillow 时自动降级为不压缩
+    except Exception:
+        return uri
+    try:
+        raw = base64.b64decode(payload, validate=False)
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+    except Exception:
+        return uri
+    if max(img.size) <= max_dim:
+        return uri  # 尺寸已在限制内，不重复编码
+    try:
+        if img.mode in ("RGBA", "LA", "P"):
+            img = img.convert("RGBA")
+            background = Image.new("RGB", img.size, (255, 255, 255))
+            background.paste(img, mask=img.split()[-1])
+            img = background
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+        img.thumbnail((max_dim, max_dim))
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=_image_jpeg_quality(), optimize=True)
+    except Exception:
+        return uri
+    encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+    if len(encoded) >= len(payload):
+        return uri
+    return "data:image/jpeg;base64," + encoded
+
+
+_IMAGE_CACHE: "OrderedDict[str, str]" = OrderedDict()
+_IMAGE_CACHE_LOCK = threading.Lock()
+_IMAGE_CACHE_MAX = 128
+
+
+def _compress_data_uri_cached(uri: str) -> str:
+    key = hashlib.sha1(uri.encode("utf-8", "ignore")).hexdigest()
+    with _IMAGE_CACHE_LOCK:
+        cached = _IMAGE_CACHE.get(key)
+        if cached is not None:
+            _IMAGE_CACHE.move_to_end(key)
+            return cached
+    result = _compress_data_uri(uri)
+    with _IMAGE_CACHE_LOCK:
+        _IMAGE_CACHE[key] = result
+        while len(_IMAGE_CACHE) > _IMAGE_CACHE_MAX:
+            _IMAGE_CACHE.popitem(last=False)
+    return result
+
+
+def _compress_images_in_messages(messages: list) -> list:
+    """压缩所有 data URI 图片（多线程 + 缓存），返回新的 messages。"""
+    if not isinstance(messages, list) or _image_max_dim() <= 0:
+        return messages
+    uris: list[str] = []
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                image = part.get("image_url")
+                url = image.get("url") if isinstance(image, dict) else None
+                if isinstance(url, str) and url.startswith("data:image/"):
+                    uris.append(url)
+    unique = list(dict.fromkeys(uris))
+    if not unique:
+        return messages
+    mapping: dict[str, str] = {}
+    if len(unique) == 1:
+        mapping[unique[0]] = _compress_data_uri_cached(unique[0])
+    else:
+        with ThreadPoolExecutor(max_workers=min(4, len(unique))) as pool:
+            for src, dst in zip(unique, pool.map(_compress_data_uri_cached, unique)):
+                mapping[src] = dst
+    if all(mapping.get(src, src) == src for src in unique):
+        return messages
+    out: list = []
+    before = after = 0
+    for msg in messages:
+        if not isinstance(msg, dict):
+            out.append(msg)
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            out.append(msg)
+            continue
+        changed = False
+        new_content = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                image = part.get("image_url")
+                if isinstance(image, dict):
+                    url = image.get("url")
+                    if isinstance(url, str) and url in mapping and mapping[url] != url:
+                        before += len(url)
+                        after += len(mapping[url])
+                        new_content.append(
+                            {**part, "image_url": {**image, "url": mapping[url]}}
+                        )
+                        changed = True
+                        continue
+            new_content.append(part)
+        out.append({**msg, "content": new_content} if changed else msg)
+    if after:
+        compressed = sum(1 for src in unique if mapping.get(src, src) != src)
+        print(
+            f"[proxy] image compression: {compressed}/{len(unique)} image(s) "
+            f"{before / 1048576:.1f} MB -> {after / 1048576:.1f} MB "
+            f"(maxDim={_image_max_dim()})",
+            file=sys.stderr,
+        )
+    return out
+
+
 def build_backend_body(payload: dict) -> dict:
     reasoning_control = resolve_reasoning_control(payload)
     body = {k: payload[k] for k in PASSTHROUGH_BODY_KEYS if k in payload}
     messages = body.get("messages")
     if isinstance(messages, list):
-        body["messages"] = [
+        messages = [
             {
                 **message,
                 "role": _BACKEND_ROLE_ALIASES.get(message.get("role"), message.get("role")),
@@ -243,6 +480,10 @@ def build_backend_body(payload: dict) -> dict:
             else message
             for message in messages
         ]
+        # 图片先按官方客户端策略压缩（最长边 1080 / JPEG），再套历史预算
+        messages = _compress_images_in_messages(messages)
+        # 历史图片预算：防止每轮全量重发的图片把请求体撑到上限
+        body["messages"] = apply_image_budget(messages)
     # Resolve model alias before forwarding
     raw_model = body.get("model", "auto")
     body["model"] = resolve_model_alias(raw_model)
@@ -732,7 +973,8 @@ async def proxy_chat_completions(
       - ("error", (status_code, detail))  错误
     """
     client_wants_stream = bool(payload.get("stream"))
-    body = build_backend_body(payload)
+    # 图片压缩/预算是 CPU 活（PIL 解码+重编码），放线程里避免阻塞事件循环
+    body = await asyncio.to_thread(build_backend_body, payload)
     if log_model is None and isinstance(api_key_info, dict):
         log_model = api_key_info.get("_log_model")
     model_name = log_model if log_model is not None else payload.get("model", "auto")
@@ -832,14 +1074,17 @@ async def test_account_chat(account: dict, model: str = "auto", prompt: str = "p
             "message": "token refresh failed or account credentials are invalid",
         }
 
-    body = build_backend_body({
-        "model": model or "auto",
-        "messages": [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": prompt or "ping"},
-        ],
-        "stream": False,
-    })
+    body = await asyncio.to_thread(
+        build_backend_body,
+        {
+            "model": model or "auto",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt or "ping"},
+            ],
+            "stream": False,
+        },
+    )
     url = f"{auth_manager.backend_url_for(account)}/v2/chat/completions"
     t0 = time.time()
     result = await _collect_stream(url, headers, body, account, None, f"account-test:{model or 'auto'}", t0)
