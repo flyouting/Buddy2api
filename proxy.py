@@ -339,16 +339,15 @@ def _image_jpeg_quality() -> int:
 def _compress_data_uri(uri: str) -> str:
     """把 data URI 图片缩到最长边 max_dim 并转 JPEG；不划算或无法识别时原样返回。
 
-    对齐 WorkBuddy AI 官方客户端的 ImageCompressionInterceptor：
-    逐张检查 input_image，超过尺寸上限时压缩，尺寸已在内则跳过。
+    比官方客户端的策略更省：官方对"尺寸已在限制内"的图片直接跳过，这里在
+    尺寸内但 base64 体积大的图片也会尝试转 JPEG，只有确实省下 30% 以上才替换。
+    这样在同样的尺寸上限下，转发体积还能再降一半左右。
     """
     max_dim = _image_max_dim()
     if max_dim <= 0 or not isinstance(uri, str):
         return uri
     header, sep, payload = uri.partition(",")
     if not sep or not header.startswith("data:image/") or ";base64" not in header:
-        return uri
-    if len(payload) < 64 * 1024:  # 小图不值得重新编码
         return uri
     try:
         from PIL import Image  # 延迟导入：没装 Pillow 时自动降级为不压缩
@@ -360,8 +359,9 @@ def _compress_data_uri(uri: str) -> str:
         img.load()
     except Exception:
         return uri
-    if max(img.size) <= max_dim:
-        return uri  # 尺寸已在限制内，不重复编码
+    over_dim = max(img.size) > max_dim
+    if not over_dim and len(payload) < 64 * 1024:
+        return uri  # 又小又合规，不折腾
     try:
         if img.mode in ("RGBA", "LA", "P"):
             img = img.convert("RGBA")
@@ -370,7 +370,8 @@ def _compress_data_uri(uri: str) -> str:
             img = background
         elif img.mode != "RGB":
             img = img.convert("RGB")
-        img.thumbnail((max_dim, max_dim))
+        if over_dim:
+            img.thumbnail((max_dim, max_dim))
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=_image_jpeg_quality(), optimize=True)
     except Exception:
@@ -378,6 +379,8 @@ def _compress_data_uri(uri: str) -> str:
     encoded = base64.b64encode(buf.getvalue()).decode("ascii")
     if len(encoded) >= len(payload):
         return uri
+    if not over_dim and len(encoded) > len(payload) * 0.7:
+        return uri  # 尺寸内：省不到 30% 不值得重新编码
     return "data:image/jpeg;base64," + encoded
 
 

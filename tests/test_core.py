@@ -854,6 +854,25 @@ def test_image_compression_skips_images_within_limits():
     assert proxy._compress_data_uri(uri) == uri
 
 
+def test_image_compression_reencodes_large_within_limit_image():
+    import base64
+    import io
+    import random
+
+    Image = pytest.importorskip("PIL.Image")
+    img = Image.frombytes("RGB", (1000, 800), random.randbytes(1000 * 800 * 3))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+    out = proxy._compress_data_uri(uri)
+
+    assert out.startswith("data:image/jpeg;base64,")
+    assert len(out) < len(uri) * 0.7
+    with Image.open(io.BytesIO(base64.b64decode(out.split(",", 1)[1]))) as compressed:
+        assert compressed.size == (1000, 800)  # 尺寸在限制内：不缩放，只换编码
+
+
 def test_image_compression_result_is_cached():
     uri = _noise_png_data_uri(2000, 1500)
     first = proxy._compress_data_uri_cached(uri)
