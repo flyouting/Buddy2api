@@ -2134,6 +2134,140 @@ def test_chat_proxy_stream_ignores_empty_repeated_tool_name(monkeypatch):
     assert done_count == 1
 
 
+def test_chat_proxy_stream_strips_empty_tool_calls_from_reasoning_deltas(monkeypatch):
+    # 上游（Buddy2api 后端）在推理分片里也带 tool_calls: []。某些客户端
+    # （@ai-sdk/openai-compatible）用 `tool_calls != null` 判断推理段是否结束，
+    # `[]` 恒为真值，会把每个推理分片切成独立 reasoning 段。网关必须剥掉空列表。
+    chunks = [
+        _chat_sse({
+            "id": "chatcmpl-empty-tool-calls",
+            "object": "chat.completion.chunk",
+            "created": 126,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "", "reasoning_content": "think0 ", "tool_calls": []},
+                "finish_reason": None,
+            }],
+        }),
+        _chat_sse({
+            "id": "chatcmpl-empty-tool-calls",
+            "object": "chat.completion.chunk",
+            "created": 126,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "", "reasoning_content": "think1 ", "tool_calls": []},
+                "finish_reason": None,
+            }],
+        }),
+        _chat_sse({
+            "id": "chatcmpl-empty-tool-calls",
+            "object": "chat.completion.chunk",
+            "created": 126,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": {"content": "answer", "tool_calls": []},
+                "finish_reason": None,
+            }],
+        }),
+        _chat_sse({
+            "id": "chatcmpl-empty-tool-calls",
+            "object": "chat.completion.chunk",
+            "created": 126,
+            "model": "test-model",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }),
+        b"data: [DONE]\n\n",
+    ]
+
+    raw = _collect_chat_proxy_stream(chunks, monkeypatch)
+    payloads, done_count = _parse_chat_proxy_sse(raw)
+
+    assert not any(payload.get("error") for payload in payloads)
+    assert done_count == 1
+    for payload in payloads:
+        for choice in payload.get("choices") or []:
+            assert "tool_calls" not in (choice.get("delta") or {})
+    reasoning = "".join(
+        (choice.get("delta") or {}).get("reasoning_content") or ""
+        for payload in payloads
+        for choice in payload.get("choices") or []
+    )
+    assert reasoning == "think0 think1 "
+
+
+def test_chat_proxy_stream_keeps_nonempty_tool_calls(monkeypatch):
+    # 剥空列表不能误伤真实工具调用：非空 tool_calls 必须原样透传。
+    chunks = [
+        _chat_sse({
+            "id": "chatcmpl-real-tool",
+            "object": "chat.completion.chunk",
+            "created": 127,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": {"reasoning_content": "think ", "tool_calls": []},
+                "finish_reason": None,
+            }],
+        }),
+        _chat_sse({
+            "id": "chatcmpl-real-tool",
+            "object": "chat.completion.chunk",
+            "created": 127,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_echo",
+                    "type": "function",
+                    "function": {"name": "echo_value", "arguments": '{"value":'},
+                }]},
+                "finish_reason": None,
+            }],
+        }),
+        _chat_sse({
+            "id": "chatcmpl-real-tool",
+            "object": "chat.completion.chunk",
+            "created": 127,
+            "model": "test-model",
+            "choices": [{
+                "index": 0,
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "function": {"arguments": '"test"}'},
+                }]},
+                "finish_reason": "",
+            }],
+        }),
+        _chat_sse({
+            "id": "chatcmpl-real-tool",
+            "object": "chat.completion.chunk",
+            "created": 127,
+            "model": "test-model",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+        }),
+        b"data: [DONE]\n\n",
+    ]
+
+    raw = _collect_chat_proxy_stream(chunks, monkeypatch)
+    payloads, done_count = _parse_chat_proxy_sse(raw)
+    tool_deltas = [
+        tool_call
+        for payload in payloads
+        for choice in payload.get("choices") or []
+        for tool_call in (choice.get("delta") or {}).get("tool_calls") or []
+    ]
+
+    assert not any(payload.get("error") for payload in payloads)
+    assert done_count == 1
+    assert [tool_call["id"] for tool_call in tool_deltas if "id" in tool_call] == ["call_echo"]
+    arguments = "".join(tool_call["function"].get("arguments", "") for tool_call in tool_deltas)
+    assert json.loads(arguments) == {"value": "test"}
+
+
 def test_chat_proxy_stream_adds_done_after_explicit_terminal_at_eof(monkeypatch):
     raw = _collect_chat_proxy_stream([
         _chat_sse({

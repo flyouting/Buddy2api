@@ -677,6 +677,11 @@ class _ChatStreamObserver:
             if tool_deltas is not None and not isinstance(tool_deltas, list):
                 self.parser_error = "The upstream Chat Completions choice had invalid tool calls."
                 return None
+            if isinstance(tool_deltas, list) and not tool_deltas:
+                # 空 tool_calls 等价于"无工具调用"，但部分客户端（如
+                # @ai-sdk/openai-compatible）用 `tool_calls != null` 判断推理段
+                # 是否结束，`[]` 恒为真值，会把每个推理分片切成独立 reasoning 段。
+                del delta["tool_calls"]
             if isinstance(tool_deltas, list):
                 for position, tool_delta in enumerate(tool_deltas):
                     if not isinstance(tool_delta, dict):
