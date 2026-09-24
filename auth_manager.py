@@ -1104,6 +1104,26 @@ def _route_sort_key(account: dict):
     )
 
 
+def _preferred_pool(accounts: list[dict], model: Optional[str]) -> list[dict]:
+    """按账号的持久状态挑出首选账号，用于「这个模型该走哪个后端」。
+
+    顺序：模型可用性 → 供应列表 → 最高优先级 → 海外优先。
+    海外优先在这里是硬约束而不是排序权重，否则国内账号一旦被粘住，
+    即使海外已恢复也永远轮不到它。
+    """
+    if not accounts:
+        return []
+    capable = [a for a in accounts if not model_is_unavailable(a, model)]
+    pool = capable or accounts
+    pool = _accounts_serving_model(pool, model)
+    if not pool:
+        return []
+    highest_priority = max(_route_priority(a) for a in pool)
+    top = [a for a in pool if _route_priority(a) == highest_priority]
+    overseas = [a for a in top if is_overseas_account(a)]
+    return overseas or top
+
+
 def _set_sticky_account(aid: int, provider: str = "workbuddy", model: Optional[str] = None):
     with _route_lock:
         _sticky_account_id[_sticky_key(provider, model)] = aid
@@ -1118,20 +1138,22 @@ def pick_account(
     已记录不支持该模型的账号尽量避开，同优先级尽量粘住当前账号。"""
     exclude_ids = exclude_ids or set()
     accounts = db.get_active_accounts(provider)
-    candidates = [
+    if not accounts:
+        return None
+
+    # 长期偏好只看持久状态，刻意不看冷却和本次排除：临时故障不该改写它。
+    preferred_ids = {a["id"] for a in _preferred_pool(accounts, model)}
+
+    usable = [
         a for a in accounts
         if a["id"] not in exclude_ids and not account_is_cooling_down(a["id"])
     ]
-    if not candidates:
+    if not usable:
+        return None
+    top_candidates = _preferred_pool(usable, model)
+    if not top_candidates:
         return None
 
-    capable = [a for a in candidates if not model_is_unavailable(a, model)]
-    if capable:
-        candidates = capable
-    candidates = _accounts_serving_model(candidates, model)
-
-    highest_priority = max(_route_priority(a) for a in candidates)
-    top_candidates = [a for a in candidates if _route_priority(a) == highest_priority]
     sticky_key = _sticky_key(provider, model)
     with _route_lock:
         sticky_id = _sticky_account_id.get(sticky_key)
@@ -1141,7 +1163,10 @@ def pick_account(
                 return sticky
 
         chosen = sorted(top_candidates, key=_route_sort_key)[0]
-        _sticky_account_id[sticky_key] = chosen["id"]
+        # 被临时故障逼出来的号（本次排除的，或顶掉的冷却账号）只服务本次请求：
+        # 把粘性写过去，会让一次 5 秒冷却永久改写长期路由。
+        if chosen["id"] in preferred_ids:
+            _sticky_account_id[sticky_key] = chosen["id"]
         return chosen
 
 
@@ -1169,7 +1194,13 @@ async def pick_account_with_fallback(
         if await refresh_token(a):
             fresh = db.get_account(a["id"])
             if fresh:
-                _set_sticky_account(fresh["id"], provider, model)
+                # 刷新同样可能只是被故障逼出来的兜底：只有它确实是长期偏好时
+                # 才写粘性，否则一次过期就能把路由永久挪到备用账号。
+                preferred_ids = {
+                    item["id"] for item in _preferred_pool(db.get_active_accounts(provider), model)
+                }
+                if fresh["id"] in preferred_ids:
+                    _set_sticky_account(fresh["id"], provider, model)
             return fresh
     return None
 

@@ -455,7 +455,12 @@ def isolated_db(tmp_path, monkeypatch):
     monkeypatch.setenv("CB_GATEWAY_MASTER_KEY", "pytest-master-key")
     credential_crypto.reset_cache()
     db.init_db()
+    # 账号 id 每个用例都从头开始，模块级的路由状态必须一起重置，否则会串用例。
+    auth_manager._sticky_account_id.clear()
+    auth_manager._account_failures.clear()
     yield path
+    auth_manager._sticky_account_id.clear()
+    auth_manager._account_failures.clear()
     credential_crypto.reset_cache()
 
 
@@ -3684,6 +3689,12 @@ def _seed_workbuddy_backends(domestic_priority: int = 0, overseas_priority: int 
     return domestic, overseas
 
 
+def _reset_routing_state():
+    """粘性表和冷却表都是模块级状态，账号 id 每个用例都会重排。"""
+    auth_manager._sticky_account_id.clear()
+    auth_manager._account_failures.clear()
+
+
 def test_pick_account_prefers_overseas_for_shared_models(isolated_db):
     auth_manager._sticky_account_id.clear()
     _seed_workbuddy_backends()
@@ -3691,6 +3702,94 @@ def test_pick_account_prefers_overseas_for_shared_models(isolated_db):
     account = auth_manager.pick_account(model="deepseek-v4.1-flash")
 
     assert account["domain"] == "www.workbuddy.ai"
+
+
+def test_pick_account_does_not_pin_domestic_after_failover(isolated_db):
+    """海外 502 转到国内后，海外恢复时不应被粘性永久挡住。"""
+    _reset_routing_state()
+    domestic_id, overseas_id = _seed_workbuddy_backends()
+
+    picked = auth_manager.pick_account(
+        exclude_ids={overseas_id}, model="deepseek-v4.1-flash"
+    )
+    assert picked["id"] == domestic_id
+    assert auth_manager._sticky_account_id.get("workbuddy:deepseek-v4.1-flash") is None
+
+    account = auth_manager.pick_account(model="deepseek-v4.1-flash")
+
+    assert account["domain"] == "www.workbuddy.ai"
+
+
+def test_pick_account_does_not_pin_domestic_during_cooldown(isolated_db):
+    """走冷却过滤（exclude_ids 为空）的兜底选号同样不该改写长期路由。"""
+    _reset_routing_state()
+    domestic_id, overseas_id = _seed_workbuddy_backends()
+    auth_manager.mark_account_failure(overseas_id, 503)
+
+    picked = auth_manager.pick_account(model="deepseek-v4.1-flash")
+
+    assert picked["id"] == domestic_id
+    assert auth_manager._sticky_account_id.get("workbuddy:deepseek-v4.1-flash") is None
+
+    auth_manager.mark_account_success(overseas_id)
+    assert (
+        auth_manager.pick_account(model="deepseek-v4.1-flash")["domain"]
+        == "www.workbuddy.ai"
+    )
+
+
+def test_pick_account_overrides_domestic_sticky_when_overseas_available(isolated_db):
+    """粘性只在海外的池子里生效：国内被粘住也不该挡住可用的海外账号。"""
+    _reset_routing_state()
+    domestic_id, _ = _seed_workbuddy_backends()
+    auth_manager._sticky_account_id["workbuddy:deepseek-v4.1-flash"] = domestic_id
+
+    account = auth_manager.pick_account(model="deepseek-v4.1-flash")
+
+    assert account["domain"] == "www.workbuddy.ai"
+
+
+def test_pick_account_keeps_sticky_within_overseas_pool(isolated_db):
+    """海外有多个账号时，同级粘性照旧生效。"""
+    _reset_routing_state()
+    domestic_id, overseas_id = _seed_workbuddy_backends()
+    second_overseas_id = db.add_account({
+        "name": "overseas-2",
+        "uid": "wb-overseas-2",
+        "provider": "workbuddy",
+        "status": "active",
+        "domain": "www.workbuddy.ai",
+        "access_token": "tok-overseas-2",
+        "expires_at": 9_999_999_999_999,
+    })
+    auth_manager._sticky_account_id["workbuddy:deepseek-v4.1-flash"] = second_overseas_id
+
+    account = auth_manager.pick_account(model="deepseek-v4.1-flash")
+
+    assert account["id"] == second_overseas_id
+    assert account["domain"] == "www.workbuddy.ai"
+
+
+def test_pick_account_with_fallback_keeps_refreshed_backup_unpinned(
+    isolated_db, monkeypatch
+):
+    """刷新兜底拿到的备用账号同样不该写进粘性表。"""
+    _reset_routing_state()
+    domestic_id, overseas_id = _seed_workbuddy_backends()
+    db.update_account(domestic_id, {"status": "expired"})
+    auth_manager.mark_account_failure(overseas_id, 503)
+
+    async def fake_refresh(account):
+        db.update_account(account["id"], {"status": "active"})
+        return True
+
+    monkeypatch.setattr(auth_manager, "refresh_token", fake_refresh)
+    picked = asyncio.run(
+        auth_manager.pick_account_with_fallback(model="deepseek-v4.1-flash")
+    )
+
+    assert picked["id"] == domestic_id
+    assert auth_manager._sticky_account_id.get("workbuddy:deepseek-v4.1-flash") is None
 
 
 def test_pick_account_skips_account_that_cannot_serve_model(isolated_db):
