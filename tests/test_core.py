@@ -1969,6 +1969,8 @@ def _collect_non_stream_upstream(monkeypatch, delta):
 
     monkeypatch.setattr(proxy.httpx, "AsyncClient", FakeAsyncClient)
     monkeypatch.setattr(auth_manager, "request_timeout", lambda _default: 30)
+    # 不 mock 掉 _log_request 的话，聚合器会把测试请求写进（未被隔离的）生产库。
+    monkeypatch.setattr(proxy, "_log_request", lambda *_args, **_kwargs: None)
 
     return asyncio.run(proxy._collect_stream(
         "https://upstream.test/v2/chat/completions",
@@ -1999,6 +2001,23 @@ def test_non_stream_aggregator_accepts_reasoning_only_output(monkeypatch):
     message = result[1]["choices"][0]["message"]
     assert message["content"] is None
     assert message["reasoning_content"] == "internal only"
+
+
+def test_log_request_with_uninitialized_t0_records_zero_duration(monkeypatch, isolated_db):
+    """t0<=0 时耗时必须记 0，否则会把当前时间戳当耗时写进统计。"""
+    monkeypatch.setattr(proxy.time, "time", lambda: 1_800_000_000.0)
+
+    proxy._log_request(
+        None, {"id": 1, "name": "test-account"}, "test-model", False,
+        0, 0, 0, 0.0, "stop", 200, "", 0,
+    )
+
+    with sqlite3.connect(isolated_db) as conn:
+        row = conn.execute(
+            "SELECT duration_ms FROM logs WHERE model='test-model'"
+        ).fetchone()
+    assert row is not None
+    assert row[0] == 0
 
 
 def test_chat_proxy_stream_normalizes_empty_finish_reason(monkeypatch):

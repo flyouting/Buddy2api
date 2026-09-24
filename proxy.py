@@ -935,7 +935,8 @@ def _log_request(api_key_info, account, model_name, stream,
                   prompt_t, completion_t, total_t, credit,
                   finish_reason, status_code, error_msg, t0,
                   increment_usage: bool = True):
-    elapsed_ms = int((time.time() - t0) * 1000)
+    # t0<=0（未初始化）时差值会变成当前时间戳，这里兜底记 0，避免污染耗时统计。
+    elapsed_ms = int((time.time() - t0) * 1000) if t0 > 0 else 0
     log_data = {
         "api_key_id": api_key_info["id"] if api_key_info else None,
         "api_key_name": api_key_info["name"] if api_key_info else None,
