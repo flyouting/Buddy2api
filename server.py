@@ -27,6 +27,17 @@ from urllib.parse import urlsplit
 from pathlib import Path
 
 import uvicorn
+
+# 本机上游 TLS 走 macOS 钥匙串信任（含 Reqable 等抓包工具的 CA）：
+# httpx 默认只信 certifi，系统代理 MITM 时会 CERTIFICATE_VERIFY_FAILED。
+# 必须在任何 SSL 上下文创建前注入。
+try:
+    import truststore
+
+    truststore.inject_into_ssl()
+except ImportError:
+    print("[startup] truststore 未安装，上游 TLS 仅信任 certifi 捆绑包", file=sys.stderr)
+
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
