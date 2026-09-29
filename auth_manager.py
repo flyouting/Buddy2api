@@ -108,6 +108,17 @@ def account_is_cooling_down(aid: int) -> bool:
 # Auth 文件扫描
 # ============================================================
 
+# 新版海外客户端把 accessToken/refreshToken 落盘成 {"$wbEncrypted": .., "envelope": ..}
+# 的加密信封对象，网关读不到明文 token，只能引导用户手动导入。
+ENCRYPTED_AUTH_REASON = (
+    "新版客户端加密格式($wbEncrypted)，暂不支持自动导入；请在管理台手动粘贴 token"
+)
+
+
+def _is_encrypted_envelope(value) -> bool:
+    return isinstance(value, dict) and "$wbEncrypted" in value
+
+
 def _expand_auth_path(path: Optional[str]) -> Optional[Path]:
     if not path:
         return None
@@ -227,6 +238,9 @@ def _safe_auth_file_meta(path: Path, existing_uids: set[str]) -> dict:
 
     account = data.get("account", {}) if isinstance(data, dict) else {}
     auth = data.get("auth", {}) if isinstance(data, dict) else {}
+    if _is_encrypted_envelope(auth.get("accessToken")) or _is_encrypted_envelope(auth.get("refreshToken")):
+        meta["reason"] = ENCRYPTED_AUTH_REASON
+        return meta
     if not auth.get("accessToken"):
         meta["reason"] = "未发现 accessToken"
         return meta
@@ -295,6 +309,8 @@ def parse_auth_file(path: Path) -> Optional[dict]:
 
     account = data.get("account", {})
     auth = data.get("auth", {})
+    if _is_encrypted_envelope(auth.get("accessToken")) or _is_encrypted_envelope(auth.get("refreshToken")):
+        return None
     if not auth.get("accessToken"):
         return None
 
