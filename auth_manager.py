@@ -109,14 +109,43 @@ def account_is_cooling_down(aid: int) -> bool:
 # ============================================================
 
 # 新版海外客户端把 accessToken/refreshToken 落盘成 {"$wbEncrypted": .., "envelope": ..}
-# 的加密信封对象，网关读不到明文 token，只能引导用户手动导入。
+# 的加密信封。workbuddy_crypto 可用本机 build-key（钥匙串→loggerGet，首次经 inspector
+# 提取一次后缓存）就地解密；解不开时才降级为手动导入引导。
 ENCRYPTED_AUTH_REASON = (
-    "新版客户端加密格式($wbEncrypted)，暂不支持自动导入；请在管理台手动粘贴 token"
+    "新版客户端加密格式($wbEncrypted)，暂无法解密；请在管理台手动粘贴 token"
 )
 
 
 def _is_encrypted_envelope(value) -> bool:
     return isinstance(value, dict) and "$wbEncrypted" in value
+
+
+def _decrypt_encrypted_document(data: dict, meta: Optional[dict] = None) -> bool:
+    """就地解密文档中的 $wbEncrypted 字段（仅读 build-key 缓存，不触发客户端重启）。
+
+    成功返回 True；失败把原因写进 meta["reason"]（若提供）并返回 False。
+    首次提取 build-key 需要重启客户端，走 server 启动钩子或管理台显式触发。
+    """
+    import workbuddy_crypto
+
+    buildkey = workbuddy_crypto.get_buildkey_payload(auto_extract=False)
+    result = workbuddy_crypto.decrypt_auth_document(data, buildkey=buildkey)
+    if result.get("ok"):
+        if meta is not None:
+            meta["decrypted_fields"] = result.get("decrypted", [])
+        return True
+    if meta is not None:
+        category = result.get("category", "unknown")
+        error = str(result.get("error", ""))[:200]
+        if category == "missing-key":
+            meta["reason"] = (
+                "新版客户端加密格式($wbEncrypted)：缺少 build-key 缓存，"
+                "重启网关会自动提取一次（macOS，需重启客户端），"
+                "或设 CB_WB_BUILDKEY 指向 payload 文件"
+            )
+        else:
+            meta["reason"] = f"加密字段解密失败({category}): {error}"
+    return False
 
 
 def _expand_auth_path(path: Optional[str]) -> Optional[Path]:
@@ -217,6 +246,8 @@ def _safe_auth_file_meta(path: Path, existing_uids: set[str]) -> dict:
         "domain": "",
         "expires_at": 0,
         "already_imported": False,
+        "encrypted_source": False,
+        "decrypted_fields": [],
     }
     try:
         st = path.stat()
@@ -239,8 +270,11 @@ def _safe_auth_file_meta(path: Path, existing_uids: set[str]) -> dict:
     account = data.get("account", {}) if isinstance(data, dict) else {}
     auth = data.get("auth", {}) if isinstance(data, dict) else {}
     if _is_encrypted_envelope(auth.get("accessToken")) or _is_encrypted_envelope(auth.get("refreshToken")):
-        meta["reason"] = ENCRYPTED_AUTH_REASON
-        return meta
+        if not _decrypt_encrypted_document(data, meta):
+            return meta
+        account = data.get("account", {}) if isinstance(data, dict) else {}
+        auth = data.get("auth", {}) if isinstance(data, dict) else {}
+        meta["encrypted_source"] = True
     if not auth.get("accessToken"):
         meta["reason"] = "未发现 accessToken"
         return meta
@@ -310,14 +344,27 @@ def parse_auth_file(path: Path) -> Optional[dict]:
     account = data.get("account", {})
     auth = data.get("auth", {})
     if _is_encrypted_envelope(auth.get("accessToken")) or _is_encrypted_envelope(auth.get("refreshToken")):
-        return None
+        if not _decrypt_encrypted_document(data):
+            return None
+        account = data.get("account", {})
+        auth = data.get("auth", {})
     if not auth.get("accessToken"):
         return None
 
+    nickname = account.get("nickname", "")
+    if isinstance(nickname, dict):
+        # kind=json 字段：解密后是 {"nick": "..."} 之类的对象，取可读值
+        nickname = (
+            nickname.get("nick")
+            or nickname.get("name")
+            or nickname.get("nickname")
+            or ""
+        )
+
     return {
-        "name": account.get("nickname", "") or path.stem,
+        "name": nickname or path.stem,
         "uid": account.get("uid", ""),
-        "nickname": account.get("nickname", ""),
+        "nickname": nickname,
         "phone": account.get("phoneNumber", ""),
         "account_type": account.get("type", "personal"),
         "access_token": auth.get("accessToken", ""),

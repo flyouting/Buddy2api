@@ -30,6 +30,7 @@ pip-wheel-metadata/
 *.secret
 *.credential
 *.credentials
+workbuddy.buildkey.json
 *token*.local
 *secret*.local
 *credential*.local
@@ -43,6 +44,7 @@ credentials/
 *.sqlite3
 *.db-wal
 *.db-shm
+*.db.bak*
 buddy2api.db
 codebuddy_gateway.db
 data/
@@ -79,7 +81,7 @@ _mimo-backup-*/
 Thumbs.db
 desktop.ini
 
-# ±¾µØÔËÐÐÊ±¼ÇÒä/²úÎï
+# ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ê±ï¿½ï¿½ï¿½ï¿½/ï¿½ï¿½ï¿½ï¿½
 .workbuddy/
 .debug/
 

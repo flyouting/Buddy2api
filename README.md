@@ -27,6 +27,8 @@ python server.py
 
 路径不对时可用 `CB_AUTH_DIR`、`CB_QCLAW_AUTH_DIR`、`CB_QWENWORK_AUTH_DIR`、`CB_TRAEWORK_AUTH_DIR` 指定。四个通道的登录文件不要混在同一个目录。只要其中一家时，可设 `CB_GATEWAY_PROVIDERS=workbuddy` 收窄。
 
+> 新版 WorkBuddy AI 海外客户端把 token 加密落盘（`$wbEncrypted` 信封）。网关能直接解密导入：macOS 上首次会短暂重启一次客户端提取 build-key（走客户端自身钥匙串权限，无需抓包、无权限弹窗），之后缓存到数据库旁的 `workbuddy.buildkey.json`（0600）。Docker / Windows 下读不到钥匙串时，可在 macOS 本机跑一次网关完成提取，再把缓存文件拷过去并设 `CB_WB_BUILDKEY`。
+
 ## 注意事项
 
 按下面「安装与启动」即可。这几条是 2.0 里最容易踩空的：
@@ -236,6 +238,7 @@ QwenWork、QClaw、TraeWork 各用自己那把 Key，不要混用。
 | `CB_QWENWORK_AUTH_DIR` | QwenWork 登录目录 |
 | `CB_TRAEWORK_AUTH_DIR` | TraeWork `storage.json` 所在目录 |
 | `CB_HOST_AUTH_DIR` | Docker 脚本用的本机 WorkBuddy 目录 |
+| `CB_WB_BUILDKEY` | WorkBuddy 新版加密 auth 的 build-key payload 文件路径（默认自动提取并缓存到数据库旁 `workbuddy.buildkey.json`） |
 | `CB_GATEWAY_ADMIN_TOKEN` | 固定管理 Token |
 | `CB_GATEWAY_DB_PATH` | 数据库路径 |
 | `CB_GATEWAY_MASTER_KEY` | 跨系统搬数据库时的加密主密钥 |

@@ -46,6 +46,7 @@ from starlette.concurrency import run_in_threadpool
 import database as db
 import auth_manager
 import catalog
+import workbuddy_crypto
 import proxy
 import responses
 import providers
@@ -576,6 +577,18 @@ async def admin_scan_accounts(
     data = await _read_json_object(request, allow_empty=True)
     auth_dir = data.get("auth_dir") if isinstance(data, dict) else None
     return await run_in_threadpool(auth_manager.auto_scan_and_import, auth_dir)
+
+
+@app.post("/admin/workbuddy/buildkey/extract")
+async def admin_extract_buildkey(
+    authorization: str | None = Header(default=None),
+):
+    """手动提取（或刷新）WorkBuddy build-key 缓存。
+
+    注意：macOS 上首次/刷新会短暂重启 WorkBuddy AI 客户端。
+    """
+    _check_admin(authorization)
+    return await run_in_threadpool(workbuddy_crypto.ensure_buildkey)
 
 
 @app.post("/admin/accounts")
@@ -1366,6 +1379,22 @@ def main():
         ap.error(str(exc))
 
     db.init_db()
+
+    def _ensure_workbuddy_buildkey():
+        """新版 WorkBuddy 客户端 token 是加密落盘的；首次缺 build-key 缓存时
+        经客户端自身（--inspect + 钥匙串 ACL）提取一次并缓存。失败不阻断启动。"""
+        try:
+            import workbuddy_crypto
+
+            status = workbuddy_crypto.ensure_buildkey()
+            if status.get("extracted"):
+                sys.stderr.write("[startup] workbuddy build-key 已提取并缓存\n")
+            elif status.get("error"):
+                sys.stderr.write(f"[startup] workbuddy build-key 提取失败: {status['error']}\n")
+        except Exception as exc:  # 任何异常都不阻断启动
+            sys.stderr.write(f"[startup] workbuddy build-key 处理异常: {exc}\n")
+
+    threading.Thread(target=_ensure_workbuddy_buildkey, daemon=True).start()
 
     startup = control_plane.startup_scan()
     sys.stderr.write(f"[startup] discover: {startup}\n")
