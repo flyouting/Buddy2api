@@ -3395,11 +3395,14 @@ def test_nonstream_collection_validates_completion(monkeypatch, isolated_db, ter
 
 
 def test_stall_detection_short_english_ack():
+    # stall 话术表只收中文（0651c89, #31），上游 f2dcd39 的英文标记刻意未跟：
+    # 短英文确认在本库不算 stall，总结性回答也不算。
     body = _tool_loop_body()
-    assert proxy._looks_like_stall_text("OK.")
-    assert proxy._looks_like_stall_text("Got it, continuing.")
-    assert proxy._is_tool_stall(body, "stop", False, "Let me write it.")
+    assert not proxy._looks_like_stall_text("OK.")
+    assert not proxy._looks_like_stall_text("Got it, continuing.")
+    assert not proxy._is_tool_stall(body, "stop", False, "Let me write it.")
     assert not proxy._looks_like_stall_text("In summary, the three files are done.")
+    assert proxy._looks_like_stall_text("好的，马上继续。")
 
 
 def test_stall_detection_rejects_summary():
